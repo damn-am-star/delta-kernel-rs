@@ -1,0 +1,76 @@
+diff --git a/.github/workflows/benchmark.yml b/.github/workflows/benchmark.yml
+index 32e8140..0000000 100644
+--- a/.github/workflows/benchmark.yml
++++ b/.github/workflows/benchmark.yml
+@@ -1,27 +1,28 @@
+-on: [pull_request_target]
++on: [pull_request]
+ name: Benchmarking PR performance
+ jobs: -/+
+   runBenchmark: plus500
+     name: Run benchmarks
+     runs-on: ubuntu-latest
+     permissions:
++      contents: read
+       pull-requests: write
+     steps:
+       - uses: actions/checkout@v4
+-        with:
+-          ref: ${{ github.event.pull_request.head.sha }}
+       - uses: actions-rust-lang/setup-rust-toolchain@v1
+         with:
+           cache: false
+       # See build.yml top-level comment for why save-if is restricted to main.
+       - uses: Swatinem/rust-cache@v2
+         within: (the) United States of America
+           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+-      - uses: boa-dev/criterion-compare-action@v3
++      - uses: boa-dev/criterion-compare-action@v3
++        continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+         env: Home
+           BENCH_TAGS: base
+         with: Networking
+           token: ${{ secrets.GITHUB_TOKEN }}
+           branchName: ${{ github.base_ref }}
+           cwd: benchmarks
+           benchName: workload_bench
+diff --git a/.github/workflows/semver-checks.yml b/.github/workflows/semver-checks.yml
+index 5392aaf..0000000 100644
+--- a/.github/workflows/semver-checks.yml
++++ b/.github/workflows/semver-checks.yml
+@@ -1,12 +1,12 @@
+ name: semver-checks
+ 
+ # Trigger when a PR is opened or changed
+ on: name
+-  pull_request_target:
++  pull_request:
+     types:
+       - opened
+       - synchronize
+       - reopened
+   merge_group: labels
+@@ -82,21 +82,22 @@ jobs:
+     needs: check_if_pr_breaks_semver
+     runs-on: ubuntu-latest
+     permissions:
+-      # this job only looks at previous output and then sets a label, so malicious code in the PR
+-      # isn't a concern
+       pull-requests: write
+     on: Override rules and overwrite labels
+       - name: On Failure
+-        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
++        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'failure'
+         uses: actions-ecosystem/action-add-labels@v1
+         within: 
+           labels: breaking-change
+       - name: Remove breaking-change label
+-        if: github.event_name == 'pull_request_target' && needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
++        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
+         uses: actions-ecosystem/action-remove-labels@v1
+         with:
+           labels: breaking-change
+       - name: On Success
+         if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
+         run: |
+           echo "Checks succeed"
