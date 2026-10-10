@@ -15,7 +15,7 @@
 //! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
-//!     StructField::new("id", DataType::INTEGER, false),
+//!     StructField::nullable("id", DataType::INTEGER),
 //! ])?);
 //!
 //! let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -32,18 +32,19 @@
 #![allow(unreachable_pub, dead_code)]
 
 use std::marker::PhantomData;
-
-use crate::actions::DomainMetadata;
-use crate::committer::Committer;
-use crate::expressions::ColumnName;
-use crate::schema::SchemaRef;
-use crate::snapshot::SnapshotRef;
-use crate::transaction::{CreateTable, Transaction};
-use crate::utils::current_time_ms;
-use crate::DeltaResult;
+use std::sync::Arc;
 
 // Re-export the builder so callers can still access it from this module path.
 pub use super::builder::create_table::CreateTableTransactionBuilder;
+use crate::actions::DomainMetadata;
+use crate::committer::Committer;
+use crate::expressions::ColumnName;
+use crate::metrics::MetricId;
+use crate::schema::SchemaRef;
+use crate::table_configuration::TableConfiguration;
+use crate::transaction::{CreateTable, Transaction};
+use crate::utils::current_time_ms;
+use crate::DeltaResult;
 
 /// A type alias for create-table transactions.
 ///
@@ -53,8 +54,8 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 ///
 /// # Operations NOT available on create-table transactions
 ///
-/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table
-///   that doesn't exist yet.
+/// - **`with_domain_metadata_removed()`** — Cannot remove domain metadata from a table that doesn't
+///   exist yet.
 /// - **`remove_files()`** — Cannot remove files from a table that has no files.
 /// - **`with_blind_append()`** — Blind append semantics don't apply to table creation.
 /// - **`update_deletion_vectors()`** — Deletion vectors require an existing table.
@@ -72,7 +73,7 @@ pub use super::builder::create_table::CreateTableTransactionBuilder;
 /// # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 ///
 /// let schema = Arc::new(StructType::try_new(vec![
-///     StructField::new("id", DataType::INTEGER, false),
+///     StructField::nullable("id", DataType::INTEGER),
 /// ])?);
 ///
 /// let result = create_table("/path/to/table", schema, "MyApp/1.0")
@@ -101,14 +102,14 @@ pub type CreateTableTransaction = Transaction<CreateTable>;
 /// use delta_kernel::transaction::create_table::create_table;
 /// use delta_kernel::schema::{DataType, StructField, StructType};
 /// use delta_kernel::committer::FileSystemCommitter;
-/// use delta_kernel::engine::default::DefaultEngineBuilder;
-/// use delta_kernel::engine::default::storage::store_from_url;
+/// use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
+/// use test_utils::delta_kernel_default_engine::storage::store_from_url;
 ///
 /// # fn main() -> delta_kernel::DeltaResult<()> {
-/// let schema = Arc::new(StructType::new_unchecked(vec![
-///     StructField::new("id", DataType::INTEGER, false),
-///     StructField::new("name", DataType::STRING, true),
-/// ]));
+/// let schema = Arc::new(StructType::try_new([
+///     StructField::nullable("id", DataType::INTEGER),
+///     StructField::nullable("name", DataType::STRING),
+/// ])?);
 ///
 /// let url = url::Url::parse("file:///tmp/my_table")?;
 /// let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
@@ -133,31 +134,31 @@ impl CreateTableTransaction {
     /// Create a new transaction for creating a new table. This is used when the table doesn't
     /// exist yet and we need to create it with Protocol and Metadata actions.
     ///
-    /// The `pre_commit_snapshot` is a synthetic snapshot created from the protocol and metadata
-    /// that will be committed. It uses `PRE_COMMIT_VERSION` as a sentinel to indicate no
-    /// version exists yet on disk.
+    /// The `effective_table_config` is the table configuration that will be committed (protocol,
+    /// metadata, schema).
     ///
     /// This is typically called via `CreateTableTransactionBuilder::build()` rather than directly.
     pub(crate) fn try_new_create_table(
-        pre_commit_snapshot: SnapshotRef,
+        effective_table_config: TableConfiguration,
         engine_info: String,
         committer: Box<dyn Committer>,
         system_domain_metadata: Vec<DomainMetadata>,
         clustering_columns: Option<Vec<ColumnName>>,
+        correlation_id: Option<Arc<str>>,
     ) -> DeltaResult<Self> {
-        // TODO(sanuj) Today transactions expect a read snapshot to be passed in and we pass
-        // in the pre_commit_snapshot for CREATE. To support other operations such as ALTERs
-        // there might be cleaner alternatives which can clearly disambiguate b/w a snapshot
-        // the was read vs the effective snapshot we will use for the commit.
         let span = tracing::info_span!(
             "txn",
-            path = %pre_commit_snapshot.table_root(),
+            path = %effective_table_config.table_root(),
             operation = "CREATE",
         );
-
         Ok(Transaction {
             span,
-            read_snapshot: pre_commit_snapshot,
+            operation_id: MetricId::new(),
+            correlation_id,
+            read_snapshot_opt: None,
+            effective_table_config,
+            should_emit_protocol: true,
+            should_emit_metadata: true,
             committer,
             operation: Some("CREATE TABLE".to_string()),
             engine_info: Some(engine_info),
@@ -167,12 +168,16 @@ impl CreateTableTransaction {
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: system_domain_metadata,
+            provided_row_tracking_high_water_mark: None,
             user_domain_removals: vec![],
             data_change: true,
+            column_defaults_acknowledged: false,
+            row_tracking_preservation_acknowledged: false,
             engine_commit_info: None,
             is_blind_append: false,
             dv_matched_files: vec![],
-            clustering_columns_physical: clustering_columns,
+            num_dv_updates: 0,
+            physical_clustering_columns: clustering_columns,
             _state: PhantomData,
         })
     }

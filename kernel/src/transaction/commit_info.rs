@@ -1,11 +1,14 @@
-use std::sync::Arc;
-
-use crate::actions::{get_log_commit_info_schema, CommitInfo, COMMIT_INFO_NAME};
-use crate::expressions::{MapData, Scalar, Transform};
-use crate::schema::{MapType, StructField, StructType, ToSchema};
-use crate::{DataType, Engine, EngineData, Error, Expression, ExpressionRef, IntoEngineData};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use super::Transaction;
+use crate::actions::{CommitInfo, COMMIT_INFO_NAME, LOG_COMMIT_INFO_SCHEMA};
+use crate::engine_data::{GetData, MapItem, RowVisitor, TypedGetData as _};
+use crate::expressions::{lit, null_lit, MapData, Scalar};
+use crate::schema::{column_name, schema_ref, ColumnName, MapType, ToSchema};
+use crate::struct_patch::ProjectionStructPatchBuilder;
+use crate::utils::require;
+use crate::{create_row, DataType, Engine, EngineData, Error, Expression, ExpressionRef};
 
 /// Builds a list of `(field_name, literal_expression)` pairs covering every [`CommitInfo`]
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
@@ -14,46 +17,30 @@ use super::Transaction;
 fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> Result<Vec<(&'static str, ExpressionRef)>, Error> {
-    let op_params_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
+    let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
     let literal_exprs = vec![
-        (
-            "timestamp",
-            Arc::new(Expression::literal(commit_info.timestamp)),
-        ),
+        ("timestamp", Arc::new(lit(commit_info.timestamp))),
         (
             "inCommitTimestamp",
-            Arc::new(Expression::literal(commit_info.in_commit_timestamp)),
+            Arc::new(lit(commit_info.in_commit_timestamp)),
         ),
-        (
-            "operation",
-            Arc::new(Expression::literal(commit_info.operation)),
-        ),
+        ("operation", Arc::new(lit(commit_info.operation))),
         (
             "operationParameters",
-            Arc::new(Expression::literal(
-                match commit_info.operation_parameters {
-                    Some(map) => Scalar::Map(MapData::try_new(
-                        op_params_map_type,
-                        map.into_iter()
-                            .map(|(k, v)| (Scalar::String(k), Scalar::String(v))),
-                    )?),
-                    None => Scalar::Null(DataType::Map(Box::new(op_params_map_type))),
-                },
-            )),
+            string_map_literal_expr(commit_info.operation_parameters, &string_map_type)?,
         ),
         (
-            "kernelVersion",
-            Arc::new(Expression::literal(commit_info.kernel_version)),
+            "operationMetrics",
+            string_map_literal_expr(commit_info.operation_metrics, &string_map_type)?,
         ),
+        ("kernelVersion", Arc::new(lit(commit_info.kernel_version))),
+        ("isBlindAppend", Arc::new(lit(commit_info.is_blind_append))),
+        ("engineInfo", Arc::new(lit(commit_info.engine_info))),
+        ("txnId", Arc::new(lit(commit_info.txn_id))),
         (
-            "isBlindAppend",
-            Arc::new(Expression::literal(commit_info.is_blind_append)),
+            "tags",
+            string_map_literal_expr(commit_info.tags, &string_map_type)?,
         ),
-        (
-            "engineInfo",
-            Arc::new(Expression::literal(commit_info.engine_info)),
-        ),
-        ("txnId", Arc::new(Expression::literal(commit_info.txn_id))),
     ];
     let expected_expr_len = CommitInfo::to_schema().fields().len();
     if literal_exprs.len() != expected_expr_len {
@@ -61,6 +48,21 @@ fn commit_info_literal_exprs(
             If CommitInfo field was added/removed, please update Expression::Literal in this function and update the with_commit_info doc comment", literal_exprs.len())));
     }
     Ok(literal_exprs)
+}
+
+fn string_map_literal_expr(
+    map: Option<HashMap<String, Option<String>>>,
+    map_type: &MapType,
+) -> Result<ExpressionRef, Error> {
+    let expression = match map {
+        Some(map) => lit(MapData::try_new(
+            map_type.clone(),
+            map.into_iter()
+                .map(|(key, value)| (Scalar::String(key), value)),
+        )?),
+        None => null_lit(map_type.clone()),
+    };
+    Ok(Arc::new(expression))
 }
 
 impl<S> Transaction<S> {
@@ -72,56 +74,47 @@ impl<S> Transaction<S> {
         match &self.engine_commit_info {
             Some((engine_commit_info, engine_commit_info_schema)) => {
                 let kernel_schema = CommitInfo::to_schema();
+                let mut commit_info = kernel_commit_info;
+                if engine_commit_info_schema.contains("tags") {
+                    let mut visitor = CommitInfoTagsVisitor::default();
+                    visitor.visit_rows_of(engine_commit_info.as_ref())?;
+                    commit_info.merge_tags(visitor.tags);
+                }
 
-                // Step 1: Build output schema - all engine fields first, then any kernel-only
-                // fields that are not already present in the engine schema appended at the end.
-                let output_fields: Vec<_> = engine_commit_info_schema
-                    .fields()
-                    .map(|field| kernel_schema.field(field.name()).unwrap_or(field))
-                    .cloned()
-                    .chain(
-                        kernel_schema
-                            .fields()
-                            .filter(|field| !engine_commit_info_schema.contains(field.name()))
-                            .cloned(),
-                    )
-                    .collect();
+                // Step 1: Build literal expressions for each CommitInfo field.
+                let literal_exprs = commit_info_literal_exprs(commit_info)?;
 
-                let output_schema = StructType::new_unchecked(output_fields);
-
-                // Step 2: Build literal expressions for each CommitInfo field.
-                let literal_exprs = commit_info_literal_exprs(kernel_commit_info)?;
-
-                // Step 3: Build Transform. Replacements must be registered before insertions so
-                // that for the last engine field (which may itself be replaced), exprs is ordered
-                // as [replace_expr, insert_exprs...]. The evaluator emits exprs in declaration
-                // order, so the replace value must come first.
-                let last_engine_field = engine_commit_info_schema.field_names().last().cloned();
-                let mut transform = Transform::new_top_level();
-
-                // First pass: replace fields that already exist in the engine schema.
+                // Step 2: Build the output schema and expression patch together. Engine fields
+                // pass through first, overlapping kernel fields are replaced in place, and
+                // kernel-only fields are appended after the last engine field.
+                let mut patch = ProjectionStructPatchBuilder::new(engine_commit_info_schema);
                 for (field_name, expr_ref) in &literal_exprs {
+                    let field = kernel_schema.field(*field_name).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "CommitInfo schema is missing field '{field_name}'"
+                        ))
+                    })?;
                     if engine_commit_info_schema.contains(*field_name) {
-                        transform = transform.with_replaced_field(*field_name, expr_ref.clone());
+                        patch = patch.replace(*field_name, field.clone(), expr_ref.clone());
                     }
                 }
-                // Second pass: append kernel-only fields after the last engine field.
                 for (field_name, expr_ref) in &literal_exprs {
+                    let field = kernel_schema.field(*field_name).ok_or_else(|| {
+                        Error::internal_error(format!(
+                            "CommitInfo schema is missing field '{field_name}'"
+                        ))
+                    })?;
                     if !engine_commit_info_schema.contains(*field_name) {
-                        transform = transform
-                            .with_inserted_field(last_engine_field.as_deref(), expr_ref.clone());
+                        patch = patch.append(field.clone(), expr_ref.clone());
                     }
                 }
+                let (output_schema, patch) = patch.build()?;
 
-                // Step 4: Wrap the transform in a struct expression so the output matches the
+                // Step 3: Wrap the patch in a struct expression so the output matches the
                 // Delta log action format `{ "commitInfo": { merged fields... } }`, consistent
-                // with the None branch which uses `get_log_commit_info_schema()`.
-                let wrapped_expr =
-                    Expression::struct_from([Arc::new(Expression::transform(transform))]);
-                let wrapped_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
-                    COMMIT_INFO_NAME,
-                    output_schema,
-                )]));
+                // with the None branch which uses `LOG_COMMIT_INFO_SCHEMA`.
+                let wrapped_expr = Expression::struct_from([patch]);
+                let wrapped_schema = schema_ref! { nullable COMMIT_INFO_NAME: (output_schema) };
                 let evaluator = engine.evaluation_handler().new_expression_evaluator(
                     engine_commit_info_schema.clone(),
                     Arc::new(wrapped_expr),
@@ -129,10 +122,51 @@ impl<S> Transaction<S> {
                 )?;
                 evaluator.evaluate(engine_commit_info.as_ref())
             }
-            None => {
-                kernel_commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine)
-            }
+            None => create_row(engine, LOG_COMMIT_INFO_SCHEMA.clone(), kernel_commit_info),
         }
+    }
+}
+
+#[derive(Default)]
+struct CommitInfoTagsVisitor {
+    tags: Option<HashMap<String, Option<String>>>,
+}
+
+impl RowVisitor for CommitInfoTagsVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES: LazyLock<[ColumnName; 1]> = LazyLock::new(|| [column_name!("tags")]);
+        static TYPES: LazyLock<[DataType; 1]> = LazyLock::new(|| {
+            [DataType::from(MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                true,
+            ))]
+        });
+        (NAMES.as_slice(), TYPES.as_slice())
+    }
+
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> Result<(), Error> {
+        require!(
+            row_count == 1,
+            Error::generic("Connector commit info must contain exactly one row")
+        );
+        let [tags_getter] = getters else {
+            return Err(Error::internal_error(format!(
+                "CommitInfoTagsVisitor received {} getters instead of one",
+                getters.len()
+            )));
+        };
+        let tags: Option<MapItem<'_>> = tags_getter.get_opt(0, "tags")?;
+        self.tags = tags.map(|tags| {
+            tags.keys()
+                .map(|key| (key.to_string(), tags.get(key).map(str::to_string)))
+                .collect()
+        });
+        Ok(())
     }
 }
 
@@ -140,9 +174,10 @@ impl<S> Transaction<S> {
 mod tests {
     use std::sync::Arc;
 
+    use super::CommitInfoTagsVisitor;
     use crate::actions::CommitInfo;
     use crate::arrow::array::{
-        Array, ArrayRef, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
+        Array, ArrayRef, AsArray, BooleanArray, Int64Array, MapArray, MapBuilder, StringArray,
         StringBuilder, StructArray,
     };
     use crate::arrow::datatypes::{
@@ -152,10 +187,11 @@ mod tests {
     use crate::committer::FileSystemCommitter;
     use crate::engine::arrow_conversion::TryIntoKernel;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::schema::{Schema, SchemaRef, StructField, StructType, ToSchema};
+    use crate::schema::{schema_ref, Schema, SchemaRef, ToSchema};
     use crate::transaction::Transaction;
-    use crate::utils::test_utils::load_test_table;
-    use crate::{DeltaResult, Engine, EngineData};
+    use crate::unit_test_utils::{assert_result_error_with_message, load_test_table};
+    use crate::utils::FoldWithOption as _;
+    use crate::{DeltaResult, Engine, EngineData, RowVisitor};
 
     // ── build_commit_info tests ────────────────────────────────────────────────
 
@@ -248,17 +284,30 @@ mod tests {
         engine_commit_info: Option<(Box<dyn EngineData>, SchemaRef)>,
     ) -> DeltaResult<(Arc<dyn Engine>, Transaction)> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let mut txn = snapshot
+        let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-            .with_operation("WRITE".to_string());
-        if let Some((engine_commit_info_data, engine_commit_info_schema)) = engine_commit_info {
-            txn = txn.with_commit_info(engine_commit_info_data, engine_commit_info_schema);
-        }
+            .with_operation("WRITE".to_string())
+            .fold_with(engine_commit_info, |txn, (data, schema)| {
+                txn.with_commit_info(data, schema)
+            });
         Ok((engine, txn))
     }
 
+    #[test]
+    fn commit_info_tags_visitor_rejects_invalid_callback_shape() {
+        let mut visitor = CommitInfoTagsVisitor::default();
+        assert_result_error_with_message(
+            visitor.visit(0, &[]),
+            "Connector commit info must contain exactly one row",
+        );
+        assert_result_error_with_message(
+            visitor.visit(1, &[]),
+            "CommitInfoTagsVisitor received 0 getters instead of one",
+        );
+    }
+
     /// no engine_commit_info -- output is the kernel CommitInfo wrapped in a "commitInfo"
-    /// outer struct, matching the Delta log action format produced by `get_log_commit_info_schema`.
+    /// outer struct, matching the Delta log action format produced by `LOG_COMMIT_INFO_SCHEMA`.
     #[test]
     fn test_build_commit_info_none_branch() -> DeltaResult<()> {
         let (engine, txn) = make_txn(None)?;
@@ -296,7 +345,7 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All CommitInfo fields are appended -- total = 2 engine + 8 CommitInfo.
+        // All CommitInfo fields are appended after the two engine-only fields.
         assert_eq!(
             commit_info.num_columns(),
             2 + CommitInfo::to_schema().fields().count()
@@ -311,6 +360,7 @@ mod tests {
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert!(get_map(commit_info, "operationParameters").len() == 0);
+        assert!(get_map(commit_info, "operationMetrics").is_empty());
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
@@ -329,6 +379,13 @@ mod tests {
         map_builder.values().append_value("stale_value");
         map_builder.append(true).unwrap();
         let stale_op_params = Arc::new(map_builder.finish()) as ArrayRef;
+        let connector_tags = stale_op_params.clone();
+        let mut metrics_map_builder =
+            MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        metrics_map_builder.keys().append_value("stale_metric");
+        metrics_map_builder.values().append_value("1");
+        metrics_map_builder.append(true).unwrap();
+        let stale_op_metrics = Arc::new(metrics_map_builder.finish()) as ArrayRef;
 
         let (data, schema) = make_engine_commit_info(
             vec![
@@ -340,20 +397,28 @@ mod tests {
                     stale_op_params.data_type().clone(),
                     true,
                 ),
+                ArrowField::new(
+                    "operationMetrics",
+                    stale_op_metrics.data_type().clone(),
+                    true,
+                ),
                 ArrowField::new("kernelVersion", ArrowDataType::Utf8, true),
                 ArrowField::new("isBlindAppend", ArrowDataType::Boolean, true),
                 ArrowField::new("engineInfo", ArrowDataType::Utf8, true),
                 ArrowField::new("txnId", ArrowDataType::Utf8, true),
+                ArrowField::new("tags", connector_tags.data_type().clone(), true),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![Some(0i64)])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["STALE_OP"])) as ArrayRef,
                 stale_op_params,
+                stale_op_metrics,
                 Arc::new(StringArray::from(vec!["v0.0.0"])) as ArrayRef,
                 Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_engine"])) as ArrayRef,
                 Arc::new(StringArray::from(vec!["stale_txn"])) as ArrayRef,
+                connector_tags,
             ],
         );
         let (engine, txn) = make_txn(Some((data, schema)))?;
@@ -363,23 +428,33 @@ mod tests {
         )?;
         let commit_info = commit_info_struct(&result);
 
-        // All 8 CommitInfo fields are present in the engine schema -- no fields appended.
-        assert_eq!(commit_info.num_columns(), 8);
+        // All CommitInfo fields are present in the engine schema -- no fields appended.
+        assert_eq!(
+            commit_info.num_columns(),
+            CommitInfo::to_schema().fields().count()
+        );
 
         assert_eq!(get_str(commit_info, "operation"), "WRITE");
         assert!(!get_str(commit_info, "kernelVersion").is_empty());
         assert_eq!(get_map(commit_info, "operationParameters").len(), 0);
+        assert!(get_map(commit_info, "operationMetrics").is_empty());
         assert!(uuid::Uuid::parse_str(get_str(commit_info, "txnId")).is_ok());
         assert!(get_i64(commit_info, "timestamp") > 0);
         assert_eq!(get_i64(commit_info, "inCommitTimestamp"), 134_000_000);
         assert_eq!(get_str(commit_info, "engineInfo"), "test_engine/1.0");
         assert!(!get_bool(commit_info, "isBlindAppend"));
+        let tags = get_map(commit_info, "tags");
+        let tag_keys = tags.column(0).as_string::<i32>();
+        let tag_values = tags.column(1).as_string::<i32>();
+        assert_eq!(tag_keys.value(0), "stale_key");
+        assert_eq!(tag_values.value(0), "stale_value");
 
         Ok(())
     }
 
     /// engine schema has partial overlap -- overlapping fields are replaced, engine-only
-    /// fields pass through, and remaining CommitInfo fields are appended after the last engine field.
+    /// fields pass through, and remaining CommitInfo fields are appended after the last engine
+    /// field.
     #[test]
     fn test_build_commit_info_partial_overlap() -> DeltaResult<()> {
         let (data, schema) = make_engine_commit_info(
@@ -413,8 +488,7 @@ mod tests {
         assert_eq!(ci.fields()[1].name(), "operation");
         assert_eq!(ci.fields()[2].name(), "myCustomField");
 
-        // Remaining CommitInfo fields (6 not in engine schema) are appended after myCustomField.
-        // Total = 3 engine fields + 6 kernel-only fields.
+        // Remaining CommitInfo fields are appended after myCustomField.
         assert_eq!(
             ci.num_columns(),
             3 + CommitInfo::to_schema().fields().count() - 2
@@ -475,7 +549,7 @@ mod tests {
     fn test_build_commit_info_empty_engine_schema() -> DeltaResult<()> {
         // A 0-row, 0-column RecordBatch with an empty kernel schema.
         let empty_batch = RecordBatch::new_empty(Arc::new(ArrowSchema::empty()));
-        let empty_schema = Arc::new(StructType::new_unchecked(Vec::<StructField>::new()));
+        let empty_schema = schema_ref! {};
         let (engine, txn) = make_txn(Some((
             Box::new(ArrowEngineData::new(empty_batch)),
             empty_schema,

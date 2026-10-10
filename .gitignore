@@ -2,7 +2,12 @@
 .DS_Store
 
 # IDE
-.claude/
+# .claude — keep private by default, allowlist published slash commands
+.claude/*
+!.claude/commands/
+.claude/commands/*
+!.claude/commands/update-user-guide.md
+/.codex/
 .cursor/
 .dir-locals.el
 .idea/
@@ -12,19 +17,23 @@
 .cache/
 .clangd
 *.*~
+**/#*.*#
 
 # Rust
 .cargo-home
 target/
-/Cargo.lock
 integration-tests/Cargo.lock
+
+# Python
+__pycache__
 
 # Project
 acceptance/tests/dat/
+acceptance/workloads/
 ffi/examples/read-table/build
 ffi/examples/visit-expression/build
 /build
 /kernel/target
 /target
 
-/benchmarks/data/workloads/
+/benchmarks/workloads/

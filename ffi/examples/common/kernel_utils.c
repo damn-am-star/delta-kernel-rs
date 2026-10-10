@@ -1,4 +1,5 @@
 #include <delta_kernel_ffi.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include "kernel_utils.h"
@@ -75,3 +76,463 @@ bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
   return true;
 }
 
+void compile_snapshot_hint_abi(void)
+{
+  KernelStringSlice string = { .ptr = NULL, .len = 0 };
+  OptionalValueKernelStringSlice optional_string = { .tag = NoneKernelStringSlice };
+  OptionalValuei64 optional_i64 = { .tag = Nonei64 };
+  OptionalValuei32 optional_i32 = { .tag = Nonei32 };
+  OptionalValueu64 optional_u64 = { .tag = Noneu64 };
+  FfiStringArray string_array = { .ptr = NULL, .len = 0 };
+  OptionalValueFfiStringArray optional_string_array = {
+    .tag = NoneFfiStringArray,
+  };
+  FfiStringMapEntry string_map_entry = { .key = string, .value = string };
+  FfiStringMap string_map = { .ptr = &string_map_entry, .len = 1 };
+  OptionalValueFfiStringMap optional_string_map = {
+    .tag = NoneFfiStringMap,
+  };
+  KernelI64Slice i64_array = { .ptr = NULL, .len = 0 };
+  FfiFileSizeHistogram histogram = {
+    .sorted_bin_boundaries = i64_array,
+    .file_counts = i64_array,
+    .total_bytes = i64_array,
+  };
+  FfiProtocol protocol_value = {
+    .min_reader_version = 1,
+    .min_writer_version = 2,
+    .reader_features = optional_string_array,
+    .writer_features = optional_string_array,
+  };
+  FfiMetadata metadata = {
+    .id = string,
+    .name = optional_string,
+    .description = optional_string,
+    .format_provider = string,
+    .format_options = string_map,
+    .schema_string = string,
+    .partition_columns = string_array,
+    .created_time = optional_i64,
+    .configuration = string_map,
+  };
+  FfiSetTransaction transaction = {
+    .app_id = string,
+    .version = 0,
+    .last_updated = optional_i64,
+  };
+  FfiDomainMetadata domain_metadata = {
+    .domain = string,
+    .configuration = string,
+    .removed = false,
+  };
+  FfiCheckpointMetadata checkpoint_metadata = {
+    .version = 0,
+    .tags = optional_string_map,
+  };
+  FfiSidecar sidecar = {
+    .path = string,
+    .size_in_bytes = 0,
+    .modification_time = 0,
+    .tags = optional_string_map,
+  };
+  FfiCheckpointNonFileAction actions[] = {
+    {
+      .tag = FfiCheckpointNonFileActionMetadata,
+      .metadata = &metadata,
+    },
+    {
+      .tag = FfiCheckpointNonFileActionProtocol,
+      .protocol = &protocol_value,
+    },
+    {
+      .tag = FfiCheckpointNonFileActionTransaction,
+      .transaction = &transaction,
+    },
+    {
+      .tag = FfiCheckpointNonFileActionDomainMetadata,
+      .domain_metadata = &domain_metadata,
+    },
+    {
+      .tag = FfiCheckpointNonFileActionCheckpointMetadata,
+      .checkpoint_metadata = &checkpoint_metadata,
+    },
+  };
+  FfiSidecarArray sidecar_array = { .ptr = &sidecar, .len = 1 };
+  FfiCheckpointNonFileActionArray action_array = {
+    .ptr = actions,
+    .len = sizeof(actions) / sizeof(actions[0]),
+  };
+  OptionalValueFfiSidecarArray optional_sidecar_array = {
+    .tag = SomeFfiSidecarArray,
+    .some = sidecar_array,
+  };
+  OptionalValueFfiCheckpointNonFileActionArray optional_action_array = {
+    .tag = SomeFfiCheckpointNonFileActionArray,
+    .some = action_array,
+  };
+  FfiLastCheckpointV2 v2_checkpoint = {
+    .path = string,
+    .size_in_bytes = optional_i64,
+    .modification_time = optional_i64,
+    .sidecar_files = optional_sidecar_array,
+    .non_file_actions = optional_action_array,
+  };
+  FfiLastCheckpoint last_checkpoint = {
+    .version = 0,
+    .size = 0,
+    .parts = optional_u64,
+    .size_in_bytes = optional_i64,
+    .num_of_add_files = optional_i64,
+    .checkpoint_schema = optional_string,
+    .checksum = optional_string,
+    .tags = optional_string_map,
+    .v2_checkpoint = &v2_checkpoint,
+  };
+  FfiSetTransactionArray transaction_array = { .ptr = &transaction, .len = 1 };
+  FfiDomainMetadataArray domain_metadata_array = {
+    .ptr = &domain_metadata,
+    .len = 1,
+  };
+  FfiFileStats file_stats = {
+    .num_files = 0,
+    .table_size_bytes = 0,
+  };
+  FfiFileStatsState file_stats_state = {
+    .kind = FfiFileStatsStateKindComplete,
+    .file_stats = file_stats,
+    .file_size_histogram = &histogram,
+  };
+  FfiSetTransactionState transaction_state = {
+    .kind = FfiSetTransactionStateKindComplete,
+    .transactions = transaction_array,
+  };
+  FfiDomainMetadataState domain_metadata_state = {
+    .kind = FfiDomainMetadataStateKindComplete,
+    .domain_metadata = domain_metadata_array,
+  };
+  OptionalValueFfiNullableStringMap optional_nullable_string_map = {
+    .tag = NoneFfiNullableStringMap,
+  };
+  FfiDeletionVectorDescriptor deletion_vector = {
+    .storage_type = FfiDeletionVectorStorageTypePersistedAbsolute,
+    .path_or_inline_dv = string,
+    .offset = optional_i32,
+    .size_in_bytes = 0,
+    .cardinality = 0,
+  };
+  FfiAdd add = {
+    .path = string,
+    .partition_values = string_map,
+    .size = 0,
+    .modification_time = 0,
+    .data_change = true,
+    .stats = optional_string,
+    .tags = optional_nullable_string_map,
+    .deletion_vector = &deletion_vector,
+    .base_row_id = optional_i64,
+    .default_row_commit_version = optional_i64,
+    .clustering_provider = optional_string,
+  };
+  FfiAddArray add_array = { .ptr = &add, .len = 1 };
+  OptionalValueFfiAddArray all_files = {
+    .tag = SomeFfiAddArray,
+    .some = add_array,
+  };
+  FfiDeletedRecordCountsHistogram deleted_record_counts_histogram = {
+    .deleted_record_counts = i64_array,
+  };
+  FfiCrc crc = {
+    .version = 0,
+    .metadata = metadata,
+    .protocol = protocol_value,
+    .file_stats_state = file_stats_state,
+    .in_commit_timestamp = optional_i64,
+    .set_transaction_state = transaction_state,
+    .domain_metadata_state = domain_metadata_state,
+    .txn_id = optional_string,
+    .all_files = all_files,
+    .num_deleted_records = optional_i64,
+    .num_deletion_vectors = optional_i64,
+    .deleted_record_counts_histogram = &deleted_record_counts_histogram,
+  };
+  LogPathArray log_paths = { .ptr = NULL, .len = 0 };
+  FfiSnapshotHint snapshot_hint = {
+    .version = 0,
+    .freshness = FfiSnapshotHintFreshnessLatest,
+    .log_paths = log_paths,
+    .protocol = protocol_value,
+    .metadata = metadata,
+    .last_checkpoint = &last_checkpoint,
+    .crc = &crc,
+  };
+  ExternResultbool (*set_snapshot_hint)(HandleMutableFfiSnapshotBuilder*,
+                                        const FfiSnapshotHint*) =
+      snapshot_builder_set_snapshot_hint;
+
+  (void)snapshot_hint;
+  (void)set_snapshot_hint;
+}
+
+// utility to print out a metric id as a uuid
+void print_metric_id(const char* name, MetricId id) {
+  const uint8_t* b = id.bytes;
+  printf("  %s: "
+         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+         name,
+         b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
+         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+// utility to print out a table type
+void print_table_type(TableType tt) {
+  printf("  table_type:");
+  switch (tt) {
+  case TableTypePathBased: printf(" PathBased,\n"); break;
+  case TableTypeCatalogManaged: printf(" CatalogManaged,\n"); break;
+  }
+}
+
+void print_load_type(SnapshotLoadType lt) {
+  printf("  load_type:");
+  switch (lt) {
+  case SnapshotLoadTypeFull: printf(" Full,\n"); break;
+  case SnapshotLoadTypeIncremental: printf(" Incremental,\n"); break;
+  case SnapshotLoadTypeSnapshotHint: printf(" SnapshotHint,\n"); break;
+  case SnapshotLoadTypeUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
+void print_log_segment_load_type(LogSegmentLoadType lt) {
+  printf("  load_type:");
+  switch (lt) {
+  case LogSegmentLoadTypeFull: printf(" Full,\n"); break;
+  case LogSegmentLoadTypeIncremental: printf(" Incremental,\n"); break;
+  case LogSegmentLoadTypeUnknown: printf(" Unknown,\n"); break;
+  }
+}
+
+#define PM_START(name) printf("\nMetric " #name " {\n")
+#define PM_END printf("}\n\n");
+#define PM_ID(s, f) print_metric_id(#f, (s).f)
+#define PM_U64(s, f)   printf("  " #f ": %" PRIu64 ",\n", (uint64_t)(s).f)
+#define PM_BOOL(s, f)  printf("  " #f ": %s,\n", (s).f ? "true" : "false")
+#define PM_SLICE(s, f) (s.f.len>0?printf("  " #f ": %.*s,\n", (int)(s).f.len, (s).f.ptr):printf("  " #f ": \"\",\n"))
+
+// print out metrics as json(ish) objects
+void print_metric(MetricEvent event) {
+  switch (event.tag) {
+  case MetricEventLogSegmentLoadSuccess:
+    PM_START(LogSegmentLoadSuccess);
+    LogSegmentLoadSuccess lsls = event.log_segment_load_success;
+    PM_ID(lsls, operation_id);
+    PM_SLICE(lsls, correlation_id);
+    print_table_type(lsls.table_type);
+    print_log_segment_load_type(lsls.load_type);
+    PM_U64(lsls, duration_ns);
+    PM_U64(lsls, num_commit_files);
+    PM_U64(lsls, num_checkpoint_files);
+    PM_U64(lsls, num_compaction_files);
+    PM_BOOL(lsls, has_crc);
+    PM_U64(lsls, crc_versions_behind);
+    PM_END;
+    return;
+
+  case MetricEventLogSegmentLoadFailure:
+    PM_START(LogSegmentLoadFailure);
+    LogSegmentLoadFailure lslf = event.log_segment_load_failure;
+    PM_ID(lslf, operation_id);
+    PM_SLICE(lslf, correlation_id);
+    print_table_type(lslf.table_type);
+    print_log_segment_load_type(lslf.load_type);
+    PM_END;
+    return;
+
+  case MetricEventProtocolMetadataLoadSuccess:
+    PM_START(ProtocolMetadataLoadSuccess);
+    ProtocolMetadataLoadSuccess pmls = event.protocol_metadata_load_success;
+    PM_ID(pmls, operation_id);
+    PM_SLICE(pmls, correlation_id);
+    print_table_type(pmls.table_type);
+    print_log_segment_load_type(pmls.load_type);
+    PM_U64(pmls, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventProtocolMetadataLoadFailure:
+    PM_START(ProtocolMetadataLoadFailure);
+    ProtocolMetadataLoadFailure pmlf = event.protocol_metadata_load_failure;
+    PM_ID(pmlf, operation_id);
+    PM_SLICE(pmlf, correlation_id);
+    print_table_type(pmlf.table_type);
+    print_log_segment_load_type(pmlf.load_type);
+    PM_END;
+    return;
+
+  case MetricEventSnapshotBuildSuccess:
+    PM_START(SnapshotBuildSuccess);
+    SnapshotBuildSuccess sbs = event.snapshot_build_success;
+    PM_ID(sbs, operation_id);
+    PM_SLICE(sbs, correlation_id);
+    print_table_type(sbs.table_type);
+    print_load_type(sbs.load_type);
+    PM_U64(sbs, version);
+    PM_U64(sbs, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventSnapshotBuildFailure:
+    PM_START(SnapshotBuildFailure);
+    SnapshotBuildFailure slf = event.snapshot_build_failure;
+    PM_ID(slf, operation_id);
+    PM_SLICE(slf, correlation_id);
+    print_table_type(slf.table_type);
+    print_load_type(slf.load_type);
+    PM_END;
+    return;
+
+  case MetricEventTransactionCommitSuccess:
+    PM_START(TransactionCommitSuccess);
+    TransactionCommitSuccess tcs = event.transaction_commit_success;
+    PM_ID(tcs, operation_id);
+    PM_SLICE(tcs, correlation_id);
+    print_table_type(tcs.table_type);
+    PM_U64(tcs, commit_version);
+    PM_U64(tcs, num_add_files);
+    PM_U64(tcs, num_remove_files);
+    PM_U64(tcs, num_dv_updates);
+    PM_U64(tcs, add_files_bytes);
+    PM_U64(tcs, remove_files_bytes);
+    PM_BOOL(tcs, is_blind_append);
+    PM_BOOL(tcs, data_change);
+    printf("operation: %.*s,\n", (int)tcs.operation.len, tcs.operation.ptr);
+    PM_U64(tcs, prepare_duration_ns);
+    PM_U64(tcs, committer_duration_ns);
+    PM_U64(tcs, total_duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventTransactionCommitFailure:
+    PM_START(TransactionCommitFailure);
+    TransactionCommitFailure tcf = event.transaction_commit_failure;
+    PM_ID(tcf, operation_id);
+    PM_SLICE(tcf, correlation_id);
+    print_table_type(tcf.table_type);
+    printf("  reason:");
+    switch (tcf.reason) {
+    case CommitFailureReasonConflict: printf(" Conflict,\n"); break;
+    case CommitFailureReasonRetryableIo: printf(" Retryable IO,\n"); break;
+    case CommitFailureReasonError: printf(" Error,\n"); break;
+    }
+    PM_END;
+    return;
+
+  case MetricEventDomainMetadataLoadSuccess:
+    PM_START(DomainMetadataLoadSuccess);
+    DomainMetadataLoadSuccess dmls = event.domain_metadata_load_success;
+    PM_BOOL(dmls, from_cache);
+    PM_U64(dmls, num_domains_returned);
+    PM_U64(dmls, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventDomainMetadataLoadFailure:
+    PM_START(DomainMetadataLoadFailure);
+    PM_END;
+    return;
+
+  case MetricEventSetTransactionLoadSuccess:
+    PM_START(SetTransactionLoadSuccess);
+    SetTransactionLoadSuccess stls = event.set_transaction_load_success;
+    PM_BOOL(stls, from_cache);
+    PM_BOOL(stls, found);
+    PM_U64(stls, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventSetTransactionLoadFailure:
+    PM_START(SetTransactionLoadFailure);
+    PM_END;
+    return;
+
+  case MetricEventCrcReadSuccess:
+    PM_START(CrcReadSuccess);
+    CrcReadSuccess crs = event.crc_read_success;
+    PM_U64(crs, bytes_read);
+    PM_U64(crs, duration_ns);
+    PM_END;
+    return;
+
+  case MetricEventCrcReadFailure:
+    PM_START(CrcReadFailure);
+    PM_END;
+    return;
+
+  case MetricEventJsonReadCompleted:
+    PM_START(MetricEventJsonReadCompleted);
+    JsonReadCompleted jrc = event.json_read_completed;
+    PM_U64(jrc, num_files);
+    PM_U64(jrc, bytes_read);
+    PM_END;
+    return;
+
+  case MetricEventParquetReadCompleted:
+    PM_START(MetricEventParquetReadCompleted);
+    ParquetReadCompleted prc = event.parquet_read_completed;
+    PM_U64(prc, num_files);
+    PM_U64(prc, bytes_read);
+    PM_END;
+    return;
+
+  case MetricEventScanMetadataCompleted:
+    PM_START(ScanMetadataCompleted);
+    ScanMetadataCompleted smc = event.scan_metadata_completed;
+    PM_ID(smc, operation_id);
+    PM_SLICE(smc, correlation_id);
+    print_table_type(smc.table_type);
+    printf("  scan_type:");
+    switch (smc.scan_type) {
+    case ScanTypeSequentialPhase: printf(" Sequential Phase,\n"); break;
+    case ScanTypeParallelPhase: printf(" Parallel Phase,\n"); break;
+    case ScanTypeFull: printf(" Full,\n"); break;
+    }
+    PM_U64(smc, duration_ns);
+    PM_U64(smc, num_add_files_seen);
+    PM_U64(smc, num_add_files_seen_from_delta_files);
+    PM_U64(smc, num_selected_add_files);
+    PM_U64(smc, selected_add_files_bytes);
+    PM_U64(smc, num_remove_files_seen_from_delta_files);
+    PM_U64(smc, num_non_file_actions);
+    PM_U64(smc, num_predicate_filtered);
+    PM_U64(smc, peak_hash_set_size);
+    PM_U64(smc, dedup_visitor_time_ns);
+    PM_U64(smc, predicate_eval_time_ns);
+    PM_END;
+    return;
+
+  case MetricEventStorageListCompleted:
+    PM_START(MetricEventStorageListCompleted);
+    StorageListCompleted slc = event.storage_list_completed;
+    PM_U64(slc, duration_ns);
+    PM_U64(slc, num_files);
+    PM_END;
+    return;
+
+  case MetricEventStorageReadCompleted:
+    PM_START(MetricEventStorageReadCompleted);
+    StorageReadCompleted src = event.storage_read_completed;
+    PM_U64(src, duration_ns);
+    PM_U64(src, num_files);
+    PM_U64(src, bytes_read);
+    PM_END;
+    return;
+
+  case MetricEventStorageCopyCompleted:
+    PM_START(MetricEventStorageCopyCompleted);
+    StorageCopyCompleted scc = event.storage_copy_completed;
+    PM_U64(scc, duration_ns);
+    PM_END;
+    return;
+
+  default: printf("\n\n WARNING: Got an unknown metric \n\n"); return;
+  }
+}

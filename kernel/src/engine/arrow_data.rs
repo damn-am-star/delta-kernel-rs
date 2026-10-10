@@ -6,8 +6,8 @@ use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{
-    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int32Type, Int64Type,
-    TimestampMicrosecondType,
+    Date32Type, Decimal128Type, Float32Type, Float64Type, GenericStringType, Int16Type, Int32Type,
+    Int64Type, Int8Type, TimestampMicrosecondType,
 };
 use crate::arrow::array::{
     Array, ArrayRef, GenericByteArray, OffsetSizeTrait, RecordBatch, RunArray, StringViewArray,
@@ -18,14 +18,15 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
 use crate::engine::arrow_conversion::TryIntoArrow as _;
+pub use crate::engine::arrow_utils::fix_nested_null_masks;
 use crate::engine_data::{EngineData, GetData, RowVisitor, StringArrayAccessor};
 use crate::expressions::ArrayData;
 use crate::schema::{ColumnName, DataType, PrimitiveType, SchemaRef};
+use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-pub use crate::engine::arrow_utils::fix_nested_null_masks;
-
-/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
+/// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract
+/// from it.
 ///
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
 /// NULL masks. The arrow parquet reader is known to produce incomplete NULL masks, for
@@ -221,7 +222,7 @@ impl EngineData for ArrowEngineData {
         // This is used to guide our depth-first extraction. If the list contains any non-leaf,
         // duplicate, or missing column references, the extracted column list will be too
         // short (error out below).
-        let mut column_map = HashMap::new();
+        let mut column_map = HashMap::with_capacity(leaf_columns.len() * 2);
 
         for (column, data_type) in leaf_columns.iter().zip(leaf_types.iter()) {
             column_map.insert(column.clone(), ColumnState::AwaitingGetter(data_type));
@@ -292,9 +293,39 @@ impl EngineData for ArrowEngineData {
         self: Box<Self>,
         mut selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        require!(
+            selection_vector.len() <= self.len(),
+            Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                self.len()
+            ))
+        );
         selection_vector.resize(self.len(), true);
         let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
         Ok(Box::new(Self::new(filtered)))
+    }
+
+    fn has_field(&self, name: &ColumnName) -> bool {
+        let mut path = name.path();
+        let Some((first, rest)) = path.split_first() else {
+            return false;
+        };
+        let Some((_, mut field)) = self.data.schema_ref().fields().find(first.as_str()) else {
+            return false;
+        };
+        path = rest;
+        while let Some((component, rest)) = path.split_first() {
+            let ArrowDataType::Struct(nested) = field.data_type() else {
+                return false;
+            };
+            let Some((_, next)) = nested.find(component.as_str()) else {
+                return false;
+            };
+            field = next;
+            path = rest;
+        }
+        true
     }
 }
 
@@ -345,9 +376,9 @@ impl ArrowEngineData {
         Ok(())
     }
 
-    /// Helper function to extract a column, supporting both direct arrays and REE-encoded (RunEndEncoded) arrays.
-    /// This reduces boilerplate by handling the common pattern of trying direct access first,
-    /// then falling back to RunArray if the column is REE-encoded.
+    /// Helper function to extract a column, supporting both direct arrays and REE-encoded
+    /// (RunEndEncoded) arrays. This reduces boilerplate by handling the common pattern of
+    /// trying direct access first, then falling back to RunArray if the column is REE-encoded.
     fn try_extract_with_ree<'a>(col: &'a dyn Array) -> Option<&'a dyn GetData<'a>> {
         match col.data_type() {
             ArrowDataType::RunEndEncoded(_, _) => col
@@ -370,21 +401,25 @@ impl ArrowEngineData {
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
             )
         };
-        let col_as_list = || -> Option<&'a dyn GetData<'a>> {
-            match col.data_type() {
-                ArrowDataType::List(f)
-                | ArrowDataType::LargeList(f)
-                | ArrowDataType::ListView(f)
-                | ArrowDataType::LargeListView(f)
-                    if is_string_type(f.data_type()) => {}
-                _ => return None,
-            }
-            col.as_list_opt::<i32>()
-                .map(|a| a as _)
-                .or_else(|| col.as_list_opt::<i64>().map(|a| a as _))
-                .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
-                .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
-        };
+        let is_struct_type = |dt: &ArrowDataType| matches!(dt, ArrowDataType::Struct(_));
+        // All four list flavors share one getter; only the element predicate distinguishes a
+        // string list from an array-of-structs.
+        let col_as_list_like =
+            |element_ok: fn(&ArrowDataType) -> bool| -> Option<&'a dyn GetData<'a>> {
+                match col.data_type() {
+                    ArrowDataType::List(f)
+                    | ArrowDataType::LargeList(f)
+                    | ArrowDataType::ListView(f)
+                    | ArrowDataType::LargeListView(f)
+                        if element_ok(f.data_type()) => {}
+                    _ => return None,
+                }
+                col.as_list_opt::<i32>()
+                    .map(|a| a as _)
+                    .or_else(|| col.as_list_opt::<i64>().map(|a| a as _))
+                    .or_else(|| col.as_list_view_opt::<i32>().map(|a| a as _))
+                    .or_else(|| col.as_list_view_opt::<i64>().map(|a| a as _))
+            };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
                 (is_string_type(array.key_type()) && is_string_type(array.value_type()))
@@ -416,6 +451,18 @@ impl ArrowEngineData {
                     .or_else(|| col.as_binary_view_opt().map(|a| a as _))
                     .or_else(|| Self::try_extract_with_ree(col))
                     .ok_or("binary")
+            }
+            &DataType::BYTE => {
+                debug!("Pushing int8 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Int8Type>()
+                    .map(|a| a as _)
+                    .ok_or("byte")
+            }
+            &DataType::SHORT => {
+                debug!("Pushing int16 array for {}", ColumnName::new(path));
+                col.as_primitive_opt::<Int16Type>()
+                    .map(|a| a as _)
+                    .ok_or("short")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
@@ -461,9 +508,22 @@ impl ArrowEngineData {
                     .map(|a| a as _)
                     .ok_or("decimal")
             }
+            DataType::Array(array) if matches!(array.element_type(), DataType::Struct(_)) => {
+                debug!("Pushing struct list for {}", ColumnName::new(path));
+                // A nested visitor sees one row per element and cannot observe a skipped one, so
+                // reject nullable elements up front, where the column can still be named.
+                require!(
+                    !array.contains_null(),
+                    Error::unexpected_column_type(format!(
+                        "On {}: array<struct> columns with nullable elements are not visitable",
+                        ColumnName::new(path)
+                    ))
+                );
+                col_as_list_like(is_struct_type).ok_or("array<struct>")
+            }
             DataType::Array(_) => {
                 debug!("Pushing list for {}", ColumnName::new(path));
-                col_as_list().ok_or("array<string>")
+                col_as_list_like(is_string_type).ok_or("array<string>")
             }
             DataType::Map(_) => {
                 debug!("Pushing map for {}", ColumnName::new(path));
@@ -491,27 +551,28 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::{Arc, LazyLock};
 
-    use crate::actions::{get_commit_schema, Metadata, Protocol};
+    use rstest::rstest;
+
+    use super::{extract_record_batch, ArrowEngineData};
+    use crate::actions::{get_commit_schema, Metadata, Protocol, LOG_PROTOCOL_SCHEMA};
     use crate::arrow::array::types::{Int32Type, Int64Type};
     use crate::arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Int32Array, Int64Array,
-        LargeBinaryArray, LargeStringArray, ListViewArray, MapArray, RecordBatch, RunArray,
-        StringArray, StringViewArray, StructArray,
+        LargeBinaryArray, LargeStringArray, ListArray, ListViewArray, MapArray, RecordBatch,
+        RunArray, StringArray, StringViewArray, StructArray,
     };
     use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::sync::SyncEngine;
+    use crate::engine::test_utils::{struct_list_fixture_as, CollectNVisitor, ListFlavor};
     use crate::engine_data::{GetData, ListItem, MapItem, RowVisitor, TypedGetData};
-    use crate::expressions::ArrayData;
-    use crate::schema::{ArrayType, ColumnName, DataType, StructField, StructType};
+    use crate::expressions::{column_name, ArrayData};
+    use crate::schema::{schema, schema_ref, ArrayType, ColumnName, ColumnNamesAndTypes, DataType};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::unit_test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
-    use rstest::rstest;
-
-    use super::{extract_record_batch, ArrowEngineData};
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
@@ -540,7 +601,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_commit_schema().project(&["protocol"])?;
+        let output_schema = LOG_PROTOCOL_SCHEMA.clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -584,10 +645,10 @@ mod tests {
         ];
 
         // Create schema for the new columns
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("age", DataType::INTEGER, true),
-            StructField::new("active", DataType::BOOLEAN, false),
-        ]));
+        let new_schema = schema_ref! {
+            nullable "age": INTEGER,
+            not_null "active": BOOLEAN,
+        };
 
         // Test the append_columns method
         let arrow_data = arrow_data.append_columns(new_schema, new_columns)?;
@@ -642,11 +703,7 @@ mod tests {
             vec![25, 30, 35],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "age",
-            DataType::INTEGER,
-            true,
-        )]));
+        let new_schema = schema_ref! { nullable "age": INTEGER };
 
         let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
@@ -674,10 +731,10 @@ mod tests {
             vec![Some("Alice".to_string()), Some("Bob".to_string())],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("email", DataType::STRING, true), // Extra field in schema
-        ]));
+        let new_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "email": STRING, // Extra field in schema
+        };
 
         let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
@@ -707,11 +764,7 @@ mod tests {
             ArrayType::new(DataType::STRING, true),
             Vec::<Option<String>>::new(),
         )?];
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "name",
-            DataType::STRING,
-            true,
-        )]));
+        let new_schema = schema_ref! { nullable "name": STRING };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -738,7 +791,7 @@ mod tests {
 
         // Create empty schema and columns
         let new_columns = vec![];
-        let new_schema = Arc::new(StructType::new_unchecked([]));
+        let new_schema = schema_ref! {};
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -775,10 +828,10 @@ mod tests {
             )?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("name", DataType::STRING, true),
-            StructField::new("age", DataType::INTEGER, true),
-        ]));
+        let new_schema = schema_ref! {
+            nullable "name": STRING,
+            nullable "age": INTEGER,
+        };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -817,11 +870,11 @@ mod tests {
             ArrayData::try_new(ArrayType::new(DataType::BOOLEAN, false), vec![true, false])?,
         ];
 
-        let new_schema = Arc::new(StructType::new_unchecked([
-            StructField::new("big_number", DataType::LONG, false),
-            StructField::new("pi", DataType::DOUBLE, true),
-            StructField::new("flag", DataType::BOOLEAN, false),
-        ]));
+        let new_schema = schema_ref! {
+            not_null "big_number": LONG,
+            nullable "pi": DOUBLE,
+            not_null "flag": BOOLEAN,
+        };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -864,11 +917,7 @@ mod tests {
             vec![true, false, true],
         )?];
 
-        let new_schema = Arc::new(StructType::new_unchecked([StructField::new(
-            "active",
-            DataType::BOOLEAN,
-            false,
-        )]));
+        let new_schema = schema_ref! { not_null "active": BOOLEAN };
 
         let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
@@ -910,7 +959,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
                 (&NAMES, &TYPES)
             }
@@ -932,7 +981,7 @@ mod tests {
         }
 
         let mut visitor = BinaryVisitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("data")], &mut visitor)?;
 
         // Verify the extracted values
         assert_eq!(visitor.values.len(), 4);
@@ -972,7 +1021,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
                 (&NAMES, &TYPES)
             }
@@ -994,7 +1043,7 @@ mod tests {
         }
 
         let mut visitor = BinaryVisitor { values: vec![] };
-        let result = arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor);
+        let result = arrow_data.visit_rows(&[column_name!("data")], &mut visitor);
 
         // Verify that we get a type mismatch error
         assert_result_error_with_message(
@@ -1039,10 +1088,10 @@ mod tests {
         // Column names requested in reverse order (not schema order)
         static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> = LazyLock::new(|| {
             vec![
-                ColumnName::new(["nested", "y"]),
-                ColumnName::new(["field_b"]),
-                ColumnName::new(["nested", "x"]),
-                ColumnName::new(["field_a"]),
+                column_name!("nested.y"),
+                column_name!("field_b"),
+                column_name!("nested.x"),
+                column_name!("field_a"),
             ]
         });
 
@@ -1099,7 +1148,7 @@ mod tests {
 
         // Request the duplicate column
         static REQUESTED_COLUMNS: LazyLock<Vec<ColumnName>> =
-            LazyLock::new(|| vec![ColumnName::new(["field_a"])]);
+            LazyLock::new(|| vec![column_name!("field_a")]);
 
         struct DummyVisitor;
         impl RowVisitor for DummyVisitor {
@@ -1243,11 +1292,11 @@ mod tests {
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static COLUMNS: LazyLock<[ColumnName; 5]> = LazyLock::new(|| {
                     [
-                        ColumnName::new(["s"]),
-                        ColumnName::new(["i"]),
-                        ColumnName::new(["l"]),
-                        ColumnName::new(["b"]),
-                        ColumnName::new(["bin"]),
+                        column_name!("s"),
+                        column_name!("i"),
+                        column_name!("l"),
+                        column_name!("b"),
+                        column_name!("bin"),
                     ]
                 });
                 static TYPES: &[DataType] = &[
@@ -1474,7 +1523,8 @@ mod tests {
 
     #[test]
     fn test_materialize_null_map() -> DeltaResult<()> {
-        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in third
+        // Create MapArray with 3 elements: 2 entries in first, 1 entry in second (null), 1 entry in
+        // third
         let keys_array = Arc::new(StringArray::from(vec![
             Some("a"),
             Some("b"), // First element (2 entries)
@@ -1544,6 +1594,35 @@ mod tests {
         Ok(())
     }
 
+    fn make_nested_batch() -> ArrowEngineData {
+        let inner = ArrowField::new(
+            "inner",
+            ArrowDataType::Struct(vec![ArrowField::new("leaf", ArrowDataType::Int32, true)].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("top", ArrowDataType::Utf8, true),
+            ArrowField::new("nested", ArrowDataType::Struct(vec![inner].into()), true),
+        ]));
+        ArrowEngineData::new(RecordBatch::new_empty(schema))
+    }
+
+    #[rstest::rstest]
+    #[case::top_level_present(["top"].as_slice(), true)]
+    #[case::top_level_absent(["missing"].as_slice(), false)]
+    #[case::nested_present(["nested", "inner"].as_slice(), true)]
+    #[case::deeply_nested_present(["nested", "inner", "leaf"].as_slice(), true)]
+    #[case::deeply_nested_absent(["nested", "inner", "nope"].as_slice(), false)]
+    // "top" is Utf8, not a struct -- cannot descend further
+    #[case::non_struct_intermediate(["top", "child"].as_slice(), false)]
+    fn has_field(#[case] path: &[&str], #[case] expected: bool) {
+        let data = make_nested_batch();
+        assert_eq!(
+            data.has_field(&ColumnName::new(path.iter().copied())),
+            expected
+        );
+    }
+
     /// visit_rows must accept all Arrow string representations (Utf8/StringArray,
     /// LargeUtf8/LargeStringArray, Utf8View/StringViewArray) when the visitor declares
     /// DataType::STRING.
@@ -1570,7 +1649,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["name"])]);
+                    LazyLock::new(|| vec![column_name!("name")]);
                 static TYPES: &[DataType] = &[DataType::STRING];
                 (&NAMES, TYPES)
             }
@@ -1588,7 +1667,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["name"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("name")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![Some("alice".into()), None, Some("charlie".into())]
@@ -1621,7 +1700,7 @@ mod tests {
                 &self,
             ) -> (&'static [ColumnName], &'static [DataType]) {
                 static NAMES: LazyLock<Vec<ColumnName>> =
-                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                    LazyLock::new(|| vec![column_name!("data")]);
                 static TYPES: &[DataType] = &[DataType::BINARY];
                 (&NAMES, TYPES)
             }
@@ -1639,7 +1718,7 @@ mod tests {
         }
 
         let mut visitor = Visitor { values: vec![] };
-        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+        arrow_data.visit_rows(&[column_name!("data")], &mut visitor)?;
         assert_eq!(
             visitor.values,
             vec![Some(b"hello".to_vec()), None, Some(b"\x00\x01".to_vec())]
@@ -1664,6 +1743,62 @@ mod tests {
                 false,
             )])),
             vec![Arc::new(list_view)],
+        )?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        struct Visitor {
+            values: Vec<Vec<String>>,
+        }
+        impl RowVisitor for Visitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![column_name!("tags")]);
+                static TYPES: LazyLock<Vec<DataType>> =
+                    LazyLock::new(|| vec![ArrayType::new(DataType::STRING, false).into()]);
+                (&NAMES, &TYPES)
+            }
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let list: ListItem<'_> = getters[0].get(i, "tags")?;
+                    self.values.push(list.materialize());
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = Visitor { values: vec![] };
+        arrow_data.visit_rows(&[column_name!("tags")], &mut visitor)?;
+        assert_eq!(
+            visitor.values,
+            vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_visit_rows_string_list() -> DeltaResult<()> {
+        // [["a", "b"], ["c"]] as a plain List<Utf8>.
+        let values = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let field = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, false));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3]));
+        let list = ListArray::new(field, offsets, values, None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "tags",
+                list.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(list)],
         )?;
         let arrow_data = ArrowEngineData::new(batch);
 
@@ -1703,5 +1838,222 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// Outer visitor that collects each row's element `n`s via the struct-list getter. The declared
+    /// element type is a parameter so a test can mis-declare it.
+    #[derive(Default)]
+    struct StructListVisitor {
+        per_row: Vec<Vec<Option<i32>>>,
+    }
+
+    impl RowVisitor for StructListVisitor {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                let element = schema! { not_null "n": INTEGER };
+                (
+                    vec![ColumnName::new(["items"])],
+                    vec![ArrayType::new(element, false).into()],
+                )
+                    .into()
+            });
+            NT.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                let mut inner = CollectNVisitor::default();
+                getters[0]
+                    .get_struct_list(i, "items")?
+                    .expect("non-null struct list")
+                    .visit_with(&mut inner)?;
+                self.per_row.push(inner.values);
+            }
+            Ok(())
+        }
+    }
+
+    /// Wrap a single `items` column in an `ArrowEngineData`.
+    fn engine_data_with_items(items: ArrayRef) -> DeltaResult<ArrowEngineData> {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "items",
+                items.data_type().clone(),
+                false,
+            )])),
+            vec![items],
+        )?;
+        Ok(ArrowEngineData::new(batch))
+    }
+
+    /// Every list encoding must route through the struct-list branch of `extract_leaf_column` and
+    /// resolve the same element ranges, including the view flavors whose rows are laid out back to
+    /// front and separated only by their sizes buffer.
+    #[rstest]
+    fn test_visit_rows_struct_list_all_flavors(
+        #[values(
+            ListFlavor::List,
+            ListFlavor::LargeList,
+            ListFlavor::ListView,
+            ListFlavor::LargeListView
+        )]
+        flavor: ListFlavor,
+    ) -> DeltaResult<()> {
+        let items = struct_list_fixture_as(&[&[1, 2], &[3]], flavor);
+        let arrow_data = engine_data_with_items(items)?;
+
+        let mut visitor = StructListVisitor::default();
+        arrow_data.visit_rows(&[ColumnName::new(["items"])], &mut visitor)?;
+        assert_eq!(visitor.per_row, vec![vec![Some(1), Some(2)], vec![Some(3)]]);
+        Ok(())
+    }
+
+    /// An `array<struct>` declaring nullable elements is rejected when getters are extracted, where
+    /// the offending column can still be named.
+    #[test]
+    fn test_visit_rows_struct_list_nullable_elements_rejected() -> DeltaResult<()> {
+        let arrow_data =
+            engine_data_with_items(struct_list_fixture_as(&[&[1, 2]], ListFlavor::List))?;
+
+        struct NullableElementVisitor;
+        impl RowVisitor for NullableElementVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NT: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+                    let element = schema! { not_null "n": INTEGER };
+                    (
+                        vec![ColumnName::new(["items"])],
+                        // contains_null = true
+                        vec![ArrayType::new(element, true).into()],
+                    )
+                        .into()
+                });
+                NT.as_ref()
+            }
+            fn visit<'a>(&mut self, _: usize, _: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+                panic!("visit must not be reached");
+            }
+        }
+
+        let err = arrow_data
+            .visit_rows(&[ColumnName::new(["items"])], &mut NullableElementVisitor)
+            .expect_err("nullable elements are not visitable");
+        assert!(err.to_string().contains("nullable elements"), "{err}");
+        Ok(())
+    }
+
+    /// Collects one int leaf, declaring whatever columns and types it is constructed with so a test
+    /// can deliberately request an absent or mistyped element field.
+    struct LeafCollector {
+        declared: &'static LazyLock<ColumnNamesAndTypes>,
+        collected: Vec<Option<i32>>,
+    }
+
+    impl RowVisitor for LeafCollector {
+        fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+            self.declared.as_ref()
+        }
+        fn visit<'a>(
+            &mut self,
+            row_count: usize,
+            getters: &[&'a dyn GetData<'a>],
+        ) -> DeltaResult<()> {
+            for i in 0..row_count {
+                self.collected.push(getters[0].get_int(i, "leaf")?);
+            }
+            Ok(())
+        }
+    }
+
+    fn nt(name: ColumnName, data_type: DataType) -> ColumnNamesAndTypes {
+        (vec![name], vec![data_type]).into()
+    }
+
+    static NESTED_ELEMENT_PATH: LazyLock<ColumnNamesAndTypes> =
+        LazyLock::new(|| nt(ColumnName::new(["inner", "deep"]), DataType::INTEGER));
+    static ABSENT_ELEMENT_COLUMN: LazyLock<ColumnNamesAndTypes> =
+        LazyLock::new(|| nt(ColumnName::new(["nope"]), DataType::INTEGER));
+    static MISTYPED_ELEMENT_COLUMN: LazyLock<ColumnNamesAndTypes> =
+        LazyLock::new(|| nt(ColumnName::new(["n"]), DataType::STRING));
+
+    /// A nested visitor's columns resolve against the element struct's schema, not the outer row's,
+    /// so a multi-segment element path must resolve while an absent or mistyped one must error.
+    #[rstest]
+    #[case::nested_path(&NESTED_ELEMENT_PATH, None)]
+    #[case::absent_column(&ABSENT_ELEMENT_COLUMN, Some("nope"))]
+    #[case::type_mismatch(&MISTYPED_ELEMENT_COLUMN, Some("n"))]
+    fn test_struct_list_element_schema_resolution(
+        #[case] declared: &'static LazyLock<ColumnNamesAndTypes>,
+        #[case] expect_err_containing: Option<&str>,
+    ) -> DeltaResult<()> {
+        // Elements are `struct<n: int, inner: struct<deep: int>>`, so a multi-segment element path
+        // has something to resolve against.
+        let deep = Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef;
+        let inner = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("deep", ArrowDataType::Int32, false)),
+            deep,
+        )])) as ArrayRef;
+        let elements = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("n", ArrowDataType::Int32, false)),
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("inner", inner.data_type().clone(), false)),
+                inner,
+            ),
+        ]);
+
+        // Wrap the element structs in a single-row list so they are visited via the public
+        // `get_struct_list` -> `visit_with` path, which exposes no offsets.
+        let element_field = Arc::new(ArrowField::new("item", elements.data_type().clone(), false));
+        let list = ListArray::new(
+            element_field,
+            OffsetBuffer::from_lengths([elements.len()]),
+            Arc::new(elements),
+            None,
+        );
+
+        let mut visitor = LeafCollector {
+            declared,
+            collected: vec![],
+        };
+        let result = list
+            .get_struct_list(0, "elements")?
+            .expect("present struct list")
+            .visit_with(&mut visitor);
+        match expect_err_containing {
+            None => {
+                result?;
+                assert_eq!(visitor.collected, vec![Some(10), Some(20)]);
+            }
+            Some(needle) => {
+                let err = result.expect_err("element schema resolution must fail");
+                assert!(err.to_string().contains(needle), "{err}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_shorter_than_data_keeps_trailing_rows() -> DeltaResult<()> {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b", "c"]));
+        let filtered = data.apply_selection_vector(vec![false])?;
+        let batch = extract_record_batch(filtered.as_ref())?;
+        let column = batch.column(0).as_string::<i32>();
+        let values: Vec<_> = column.iter().flatten().collect();
+        assert_eq!(values, ["b", "c"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_selection_vector_longer_than_data_returns_error() {
+        let data = string_array_to_engine_data(StringArray::from(vec!["a", "b"]));
+        let result = data.apply_selection_vector(vec![true, true, true]);
+        assert_result_error_with_message(result, "Selection vector is larger than data length");
     }
 }

@@ -14,6 +14,8 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
   ExternResultusize visit_res;
   if (strcmp(item->type, "string") == 0) {
     visit_res = visit_field_string(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "void") == 0) {
+    visit_res = visit_field_void(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "integer") == 0) {
     visit_res = visit_field_integer(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "short") == 0) {
@@ -36,6 +38,10 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     visit_res = visit_field_timestamp(state, name, item->is_nullable, allocate_error);
   } else if (strcmp(item->type, "timestamp_ntz") == 0) {
     visit_res = visit_field_timestamp_ntz(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "interval year to month") == 0) {
+    visit_res = visit_field_interval_year_month(state, name, item->is_nullable, allocate_error);
+  } else if (strcmp(item->type, "interval day to second") == 0) {
+    visit_res = visit_field_interval_day_time(state, name, item->is_nullable, allocate_error);
   } else if (strncmp(item->type, "decimal", 7) == 0) {
     unsigned int precision;
     int scale;

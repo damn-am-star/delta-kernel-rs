@@ -20,17 +20,17 @@
 //! IDs are consumed when used. Each element takes ownership of its referenced child
 //! elements. Trying to pass an ID more than once to a complex field visitor will result in an
 //! error.
-//!
 
-use crate::{
-    AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
-    TryFromStringSlice,
-};
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::{DeltaResult, Error};
 use tracing::warn;
+
+use crate::{
+    AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
+    TryFromStringSlice,
+};
 
 #[derive(Default)]
 pub struct KernelSchemaVisitorState {
@@ -90,7 +90,8 @@ fn visit_field_primitive_impl(
     Ok(wrap_field(state, field))
 }
 
-// TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded code
+// TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded
+// code
 /// Visit a string field. Strings can hold arbitrary UTF-8 text data.
 ///
 /// # Safety
@@ -307,7 +308,62 @@ pub unsafe extern "C" fn visit_field_timestamp_ntz(
         .into_extern_result(&allocate_error)
 }
 
-/// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified precision and scale.
+/// Visit an interval year-month field. Values store signed month counts.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_interval_year_month(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalYearMonth, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit an interval day-time field. Values store signed microsecond durations.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_interval_day_time(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::IntervalDayTime, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a void field. Void fields are not materialized in data files and read as all-null columns.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_void(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Void, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified
+/// precision and scale.
 ///
 /// # Safety
 ///
@@ -391,7 +447,7 @@ fn create_struct_data_type(
         .collect::<DeltaResult<Vec<_>>>()?;
 
     let struct_type = StructType::try_new(field_vec)?;
-    Ok(DataType::Struct(Box::new(struct_type)))
+    Ok(DataType::from(struct_type))
 }
 
 fn visit_field_struct_impl(
@@ -455,8 +511,8 @@ fn visit_field_array_impl(
 ///
 /// # Safety
 ///
-/// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and `value_type_id`
-/// from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
+/// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and
+/// `value_type_id` from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
@@ -551,29 +607,12 @@ fn create_variant_data_type(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::error::{EngineError, KernelError};
-    use crate::ffi_test_utils::ok_or_panic;
-    use crate::KernelStringSlice;
     use delta_kernel::schema::{DataType, PrimitiveType};
 
-    // Error allocator for tests that panics when invoked. It is used in tests where we don't expect errors.
-    #[no_mangle]
-    extern "C" fn test_allocate_error(
-        etype: KernelError,
-        msg: crate::KernelStringSlice,
-    ) -> *mut EngineError {
-        panic!(
-            "Error allocator called with type {:?}, message: {:?}",
-            etype,
-            unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
-            }
-        );
-    }
+    use super::*;
+    use crate::error::{EngineError, KernelError};
+    use crate::ffi_test_utils::{allocate_err, ok_or_panic};
+    use crate::KernelStringSlice;
 
     macro_rules! visit_field {
         ($type:ident, $state:ident, $name:expr, $nullable:tt) => {
@@ -582,7 +621,7 @@ mod tests {
                     &mut $state,
                     KernelStringSlice::new_unsafe($name),
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -595,7 +634,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     arg1,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -610,7 +649,7 @@ mod tests {
                     arg1,
                     arg2,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             }) }
         };
@@ -625,7 +664,7 @@ mod tests {
                     KernelStringSlice::new_unsafe($name),
                     ef,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -642,7 +681,7 @@ mod tests {
                     kf,
                     vf,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -659,7 +698,7 @@ mod tests {
                     fields.as_ptr(),
                     field_count,
                     $nullable,
-                    test_allocate_error,
+                    allocate_err,
                 )
             })
         }};
@@ -751,6 +790,9 @@ mod tests {
         //   col_date: date,
         //   col_timestamp: timestamp,
         //   col_timestamp_ntz: timestamp_ntz,
+        //   col_interval_year_month: interval year to month,
+        //   col_interval_day_time: interval day to second,
+        //   col_void: void,
         //   col_decimal: decimal(10,2),
         //   col_array: array<string>,
         //   col_map: map<string, long>,
@@ -773,6 +815,11 @@ mod tests {
         let col_date = visit_field!(date, state, "col_date", false);
         let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false);
         let col_timestamp_ntz = visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false);
+        let col_interval_year_month =
+            visit_field!(interval_year_month, state, "col_interval_year_month", false);
+        let col_interval_day_time =
+            visit_field!(interval_day_time, state, "col_interval_day_time", false);
+        let col_void = visit_field!(void, state, "col_void", false);
         let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
@@ -817,6 +864,9 @@ mod tests {
             col_date,
             col_timestamp,
             col_timestamp_ntz,
+            col_interval_year_month,
+            col_interval_day_time,
+            col_void,
             col_decimal,
             col_array,
             col_map,
@@ -830,14 +880,14 @@ mod tests {
                 all_columns.as_ptr(),
                 all_columns.len(),
                 false,
-                test_allocate_error,
+                allocate_err,
             )
         });
 
         // Verify the schema
         let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-        assert_eq!(fields.len(), 17);
+        assert_eq!(fields.len(), 20);
 
         // Validate the primitive fields
         let primitive_field_expectations = [
@@ -853,6 +903,9 @@ mod tests {
             ("col_date", PrimitiveType::Date),
             ("col_timestamp", PrimitiveType::Timestamp),
             ("col_timestamp_ntz", PrimitiveType::TimestampNtz),
+            ("col_interval_year_month", PrimitiveType::IntervalYearMonth),
+            ("col_interval_day_time", PrimitiveType::IntervalDayTime),
+            ("col_void", PrimitiveType::Void),
         ];
 
         for (index, (expected_name, expected_type)) in
@@ -866,25 +919,25 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        assert_eq!(fields[12].name(), "col_decimal");
-        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[12].data_type()
+        assert_eq!(fields[15].name(), "col_decimal");
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[15].data_type()
         else {
             panic!("Field col_decimal is not a decimal type");
         };
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        assert_eq!(fields[13].name(), "col_array");
-        assert_array(fields[13], DataType::STRING, false);
+        assert_eq!(fields[16].name(), "col_array");
+        assert_array(fields[16], DataType::STRING, false);
 
-        assert_eq!(fields[14].name(), "col_map");
-        assert_map(fields[14], DataType::STRING, DataType::LONG, false);
+        assert_eq!(fields[17].name(), "col_map");
+        assert_map(fields[17], DataType::STRING, DataType::LONG, false);
 
-        assert_eq!(fields[15].name(), "col_struct");
-        assert_struct(fields[15], DataType::STRING, false);
+        assert_eq!(fields[18].name(), "col_struct");
+        assert_struct(fields[18], DataType::STRING, false);
 
-        assert_eq!(fields[16].name(), "col_variant");
-        let DataType::Variant(variant_type) = fields[16].data_type() else {
+        assert_eq!(fields[19].name(), "col_variant");
+        let DataType::Variant(variant_type) = fields[19].data_type() else {
             panic!("Expected variant type for col_variant");
         };
         let variant_fields: Vec<_> = variant_type.fields().collect();
@@ -915,7 +968,8 @@ mod tests {
         // struct<
         //   col_nested: 1.array<2.map<2a.struct<key_id: long>, 2b.struct<
         //     inner_arrays: 3.array<4.struct<
-        //       deep_maps: 4a.map<4a1.variant<metadata: binary, value: binary>, 4a2.array<decimal(10,2)>>,
+        //       deep_maps: 4a.map<4a1.variant<metadata: binary, value: binary>,
+        //                  4a2.array<decimal(10,2)>>,
         //       variant_data: 4b.variant<metadata: binary, value: binary>,
         //       nested_struct: 4c.struct<
         //         final_array: 5.array<6.map<6a.struct<coord: double>, 6b.double>>
@@ -1297,17 +1351,15 @@ mod tests {
 
     #[test]
     fn cannot_use_nullable_as_map_keys() {
-        // Error allocator for tests that panics when invoked. It is used in tests where we don't expect errors.
+        // Error allocator for tests that panics when invoked. It is used in tests where we don't
+        // expect errors.
         #[no_mangle]
         extern "C" fn ensure_map_err(
             _etype: KernelError,
             msg: crate::KernelStringSlice,
         ) -> *mut EngineError {
             let msg = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    msg.ptr as *const u8,
-                    msg.len,
-                ))
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(msg.ptr.cast(), msg.len))
             };
             assert_eq!(
                 msg,

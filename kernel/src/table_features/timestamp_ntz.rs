@@ -3,11 +3,9 @@
 use super::TableFeature;
 use crate::schema::{PrimitiveType, Schema};
 use crate::table_configuration::TableConfiguration;
-use crate::transforms::SchemaTransform;
+use crate::transforms::{transform_output_type, SchemaTransform};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use std::borrow::Cow;
 
 /// Validates that if a table schema contains TIMESTAMP_NTZ columns, the table must have the
 /// TimestampWithoutTimezone feature in both reader and writer features.
@@ -27,51 +25,45 @@ pub(crate) fn validate_timestamp_ntz_feature_support(tc: &TableConfiguration) ->
 /// Checks if any column in the schema (including nested structs, arrays, maps) uses
 /// the TIMESTAMP_NTZ primitive type.
 pub(crate) fn schema_contains_timestamp_ntz(schema: &Schema) -> bool {
-    let mut uses_timestamp_ntz = UsesTimestampNtz(false);
-    let _ = uses_timestamp_ntz.transform_struct(schema);
-    uses_timestamp_ntz.0
+    UsesTimestampNtz.transform_struct(schema).is_err()
 }
 
-struct UsesTimestampNtz(bool);
+struct UsesTimestampNtz;
 
 impl<'a> SchemaTransform<'a> for UsesTimestampNtz {
-    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
-        if *ptype == PrimitiveType::TimestampNtz {
-            self.0 = true;
+    transform_output_type!(|'a, T| Result<(), ()>);
+
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Result<(), ()> {
+        match ptype {
+            PrimitiveType::TimestampNtz => Err(()),
+            _ => Ok(()),
         }
-        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::actions::Protocol;
-    use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::schema::schema;
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_schema_feature_validation;
+    use crate::unit_test_utils::assert_schema_feature_validation;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
-        let schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("ts", DataType::Primitive(PrimitiveType::TimestampNtz), true),
-        ]);
-        let schema_without = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new("name", DataType::STRING, true),
-        ]);
-        let nested_schema_with = StructType::new_unchecked([
-            StructField::new("id", DataType::INTEGER, false),
-            StructField::new(
-                "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
-                    "inner_ts",
-                    DataType::Primitive(PrimitiveType::TimestampNtz),
-                    true,
-                )]))),
-                true,
-            ),
-        ]);
+        let schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "ts": TIMESTAMP_NTZ,
+        };
+        let schema_without = schema! {
+            not_null "id": INTEGER,
+            nullable "name": STRING,
+        };
+        let nested_schema_with = schema! {
+            not_null "id": INTEGER,
+            nullable "nested": {
+                nullable "inner_ts": TIMESTAMP_NTZ,
+            },
+        };
         let protocol_with = Protocol::try_new_modern(
             [TableFeature::TimestampWithoutTimezone],
             [TableFeature::TimestampWithoutTimezone],

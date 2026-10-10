@@ -1,25 +1,25 @@
 use std::collections::HashSet;
 
-use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
+use super::{EngineDataResultIterator, Transaction};
+use crate::actions::{DomainMetadata, INTERNAL_DOMAIN_PREFIX, LOG_DOMAIN_METADATA_SCHEMA};
 use crate::error::Error;
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
-use crate::{DeltaResult, Engine, IntoEngineData};
-
-use super::{EngineDataResultIterator, Transaction};
+use crate::{create_row, DeltaResult, Engine};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
     ///
     /// Enforces the following rules:
     /// - DomainMetadata feature must be supported if any domain operations are present
-    /// - System domains (in system_domain_metadata_additions) must correspond to a known feature
+    /// - System domains must correspond to a known feature
     /// - User domains cannot use the delta.* prefix (system-reserved)
     /// - Domain removals are not allowed in create-table transactions
-    /// - No duplicate domains within a single transaction (across both user and system)
+    /// - No duplicate domains within a single transaction (across user and system operations)
     pub(super) fn validate_domain_metadata_operations(&self) -> DeltaResult<()> {
         // Feature validation (applies to all transactions with domain operations)
         let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
+            || self.provided_row_tracking_high_water_mark.is_some()
             || !self.user_domain_metadata_additions.is_empty()
             || !self.user_domain_removals.is_empty();
 
@@ -29,8 +29,7 @@ impl<S> Transaction<S> {
         }
 
         if !self
-            .read_snapshot
-            .table_configuration()
+            .effective_table_config
             .is_feature_supported(&TableFeature::DomainMetadata)
         {
             return Err(Error::unsupported(
@@ -41,12 +40,12 @@ impl<S> Transaction<S> {
         let is_create = self.is_create_table();
         let mut seen_domains = HashSet::with_capacity(
             self.system_domain_metadata_additions.len()
+                + usize::from(self.provided_row_tracking_high_water_mark.is_some())
                 + self.user_domain_metadata_additions.len()
                 + self.user_domain_removals.len(),
         );
 
-        // Validate SYSTEM domain additions (from transforms, e.g., clustering)
-        // System domains are only populated during create-table
+        // Validate system-domain additions produced by create-table transforms.
         for dm in &self.system_domain_metadata_additions {
             let domain = dm.domain();
 
@@ -57,6 +56,16 @@ impl<S> Transaction<S> {
             if !seen_domains.insert(domain) {
                 return Err(Error::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
+                )));
+            }
+        }
+
+        // Validate the dedicated existing-table row-tracking operation with the other domains.
+        if self.provided_row_tracking_high_water_mark.is_some() {
+            self.validate_system_domain_feature(ROW_TRACKING_DOMAIN_NAME)?;
+            if !seen_domains.insert(ROW_TRACKING_DOMAIN_NAME) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {ROW_TRACKING_DOMAIN_NAME} already specified in this transaction"
                 )));
             }
         }
@@ -109,12 +118,14 @@ impl<S> Transaction<S> {
         Ok(())
     }
 
-    /// Validate that a system domain corresponds to a known feature and that the feature is supported.
+    /// Validate that a system domain corresponds to a known feature and that the feature is
+    /// supported.
     ///
-    /// This prevents arbitrary `delta.*` domains from being added during table creation.
-    /// Each known system domain must have its corresponding feature enabled in the protocol.
+    /// This prevents arbitrary `delta.*` domains from entering a transaction through internal
+    /// transforms or dedicated system-domain operations. Each known system domain must have its
+    /// corresponding feature enabled in the protocol.
     fn validate_system_domain_feature(&self, domain: &str) -> DeltaResult<()> {
-        let table_config = self.read_snapshot.table_configuration();
+        let table_config = &self.effective_table_config;
 
         // Map domain to its required feature
         let required_feature = match domain {
@@ -162,7 +173,7 @@ impl<S> Transaction<S> {
             .map(String::as_str)
             .collect();
         let existing_domains = self
-            .read_snapshot
+            .read_snapshot()?
             .get_domain_metadatas_internal(engine, Some(&domains))?;
 
         // Create removal tombstones with pre-image configurations
@@ -182,13 +193,13 @@ impl<S> Transaction<S> {
     ///
     /// Returns a tuple of `(action_iter, domain_metadata_vec)`.
     /// - The action iterator contains EngineData to be written to the commit file (`00N.json`).
-    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta),
-    ///   which feeds the post-commit snapshot with the domain metadata written in this transaction
-    ///   and powers CRC file writes.
+    /// - The `Vec<DomainMetadata>` is used to construct a [`CrcDelta`](crate::crc::CrcDelta), which
+    ///   feeds the post-commit snapshot with the domain metadata written in this transaction and
+    ///   powers CRC file writes.
     ///
-    /// This function may perform an expensive log replay operation if there are any domain removals.
-    /// The log replay is required to fetch the previous configuration value for the domain to preserve
-    /// in removal tombstones as mandated by the Delta spec.
+    /// This function may perform an expensive log replay operation if there are any domain
+    /// removals. The log replay is required to fetch the previous configuration value for the
+    /// domain to preserve in removal tombstones as mandated by the Delta spec.
     pub(super) fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
@@ -199,14 +210,7 @@ impl<S> Transaction<S> {
         // Validate domain operations (includes feature validation)
         self.validate_domain_metadata_operations()?;
 
-        // TODO(sanuj) Create-table must not have row tracking or removals
-        // Defensive. Needs to be updated when row tracking support is added.
         if is_create {
-            if row_tracking_high_watermark.is_some() {
-                return Err(Error::internal_error(
-                    "CREATE TABLE cannot have row tracking domain metadata",
-                ));
-            }
             // user_domain_removals already validated above, but be explicit
             debug_assert!(self.user_domain_removals.is_empty());
         }
@@ -214,7 +218,28 @@ impl<S> Transaction<S> {
         // Generate removal actions (empty for create-table due to validation above)
         let removal_actions = self.generate_user_domain_removal_actions(engine)?;
 
-        // Generate row tracking domain action (None for create-table)
+        let row_tracking_high_watermark = if let Some(provided) =
+            self.provided_row_tracking_high_water_mark
+        {
+            let calculated = match row_tracking_high_watermark {
+                Some(metadata) => metadata.high_water_mark(),
+                None => {
+                    RowTrackingDomainMetadata::get_high_water_mark(self.read_snapshot()?, engine)?
+                        .unwrap_or(RowTrackingDomainMetadata::MISSING_ROW_ID_HIGH_WATERMARK)
+                }
+            };
+            if provided < calculated {
+                return Err(Error::generic(format!(
+                    "Provided row-tracking high-water mark {provided} cannot be less than the \
+                         calculated value {calculated}",
+                )));
+            }
+            Some(RowTrackingDomainMetadata::new(provided))
+        } else {
+            row_tracking_high_watermark
+        };
+
+        // Generate the single row-tracking domain action, if any.
         let row_tracking_domain_action = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
@@ -230,12 +255,12 @@ impl<S> Transaction<S> {
             .chain(removal_actions)
             .collect();
 
-        let schema = get_log_domain_metadata_schema().clone();
+        let schema = LOG_DOMAIN_METADATA_SCHEMA.clone();
 
         let dm_actions_iter: Vec<_> = dm_actions_vec
             .iter()
             .cloned()
-            .map(|dm| dm.into_engine_data(schema.clone(), engine))
+            .map(|dm| create_row(engine, schema.clone(), dm))
             .collect();
 
         Ok((Box::new(dm_actions_iter.into_iter()), dm_actions_vec))

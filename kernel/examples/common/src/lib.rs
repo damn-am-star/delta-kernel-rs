@@ -1,19 +1,20 @@
 //! Common code to be shared between all examples. Mostly argument parsing, and a few other
 //! utilities
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use clap::{Args, CommandFactory, FromArgMatches};
-use delta_kernel::{
-    arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
-    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
-    SnapshotRef,
-};
-
-use delta_kernel::object_store::{
-    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
-    DynObjectStore, ObjectStoreScheme,
-};
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::object_store::aws::AmazonS3Builder;
+use delta_kernel::object_store::azure::MicrosoftAzureBuilder;
+use delta_kernel::object_store::gcp::GoogleCloudStorageBuilder;
+use delta_kernel::object_store::ObjectStoreScheme;
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::MetadataColumnSpec;
+use delta_kernel::{DeltaResult, SnapshotRef};
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::EngineStore;
+use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use url::Url;
 
 #[derive(Args)]
@@ -44,8 +45,8 @@ pub struct LocationArgs {
     pub env_creds: bool,
 
     /// Specify that the table is "public" (i.e. no cloud credentials are needed). This is required
-    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by talking
-    /// to the aws metadata server, which will fail unless you're on an ec2 instance.
+    /// for things like s3 public buckets, otherwise the kernel will try and authenticate by
+    /// talking to the aws metadata server, which will fail unless you're on an ec2 instance.
     #[arg(long)]
     pub public: bool,
 }
@@ -133,18 +134,29 @@ pub fn get_engine(
         })?;
         use ObjectStoreScheme::*;
         let url_str = url.to_string();
-        let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
-            GoogleCloudStorage => Arc::new(
-                GoogleCloudStorageBuilder::from_env()
-                    .with_url(url_str)
-                    .build()?,
-            ),
-            MicrosoftAzure => Arc::new(
-                MicrosoftAzureBuilder::from_env()
-                    .with_url(url_str)
-                    .build()?,
-            ),
+        let bucket = if url.scheme() == "https"
+            && url.host_str().is_some_and(|host| host.starts_with("s3."))
+        {
+            url.path_segments().and_then(|mut segments| segments.next())
+        } else {
+            url.host_str()
+        };
+        let ordered = scheme != AmazonS3
+            || !bucket.is_some_and(|bucket| bucket.contains("--x-s3") || bucket.contains("-xa-s3"));
+        macro_rules! engine_store {
+            ($builder:ty) => {{
+                let store = Arc::new(<$builder>::from_env().with_url(url_str).build()?);
+                if ordered {
+                    EngineStore::from_ordered_paginated(store)
+                } else {
+                    EngineStore::from_paginated(store)
+                }
+            }};
+        }
+        let store = match scheme {
+            AmazonS3 => engine_store!(AmazonS3Builder),
+            GoogleCloudStorage => engine_store!(GoogleCloudStorageBuilder),
+            MicrosoftAzure => engine_store!(MicrosoftAzureBuilder),
             Local | Memory | Http => {
                 return Err(delta_kernel::Error::Generic(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
@@ -157,13 +169,13 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
+        Ok(DefaultEngineBuilder::new(store).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?).build())
+        Ok(DefaultEngineBuilder::new(EngineStore::from_url_opts(url, opts)?).build())
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -173,7 +185,7 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, options)?).build())
+        Ok(DefaultEngineBuilder::new(EngineStore::from_url_opts(url, options)?).build())
     }
 }
 

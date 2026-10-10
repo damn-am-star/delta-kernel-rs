@@ -1,16 +1,18 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::cmp::Ordering;
 use std::slice;
 use std::str::FromStr;
+
+use delta_kernel_derive::internal_api;
+use percent_encoding::percent_decode_str;
+use url::Url;
+use uuid::Uuid;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
-use delta_kernel_derive::internal_api;
-
-use url::Url;
-use uuid::Uuid;
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
@@ -26,6 +28,8 @@ const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 /// The subdirectory name within the delta log where staged commits reside
 const STAGED_COMMITS_DIR: &str = "_staged_commits/";
+/// The subdirectory name within the delta log where checkpoint sidecars reside
+const SIDECAR_DIR_WITH_SLASH: &str = "_sidecars/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -33,7 +37,13 @@ pub(crate) enum LogPathFileType {
     Commit,
     /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
     StagedCommit,
-    SinglePartCheckpoint,
+    /// A classic-named checkpoint, `<version>.checkpoint.parquet`. The name is the file-naming
+    /// scheme, not the spec version: this file may hold a V1 checkpoint with its actions inline,
+    /// or a V2 checkpoint that references sidecars.
+    ClassicCheckpoint,
+    /// A uuid-named checkpoint, `<version>.checkpoint.<uuid>.{parquet,json}`. Always V2, since
+    /// only the V2 spec writes this naming scheme. Each writer picks a fresh uuid, so several
+    /// can share a version.
     #[allow(unused)]
     UuidCheckpoint,
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit
@@ -50,6 +60,60 @@ pub(crate) enum LogPathFileType {
     },
     Crc,
     Unknown,
+}
+
+/// Identifies one checkpoint among those at a single version and orders it against its siblings.
+///
+/// The variant is the naming scheme, read from the file name with no I/O. Naming scheme and
+/// [checkpoint spec] are independent: only multi-part (always V1) and uuid (always V2) pin the
+/// spec, so a `Classic` checkpoint follows either one and only its contents say which.
+///
+/// Variant order is the rank and each payload breaks ties within a rank, so the derived [`Ord`] is
+/// the whole comparison: `Uuid` > `MultiPart` > `Classic`, matching Delta-Spark. Reordering these
+/// changes which checkpoint kernel selects.
+///
+/// [checkpoint spec]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-specs
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[internal_api]
+pub(crate) enum CheckpointInstance {
+    /// `<version>.checkpoint.parquet`. At most one per version, so nothing to break ties on.
+    Classic,
+    /// `<version>.checkpoint.<part_num>.<num_parts>.parquet`. More parts wins.
+    MultiPart { num_parts: u32 },
+    /// `<version>.checkpoint.<uuid>.{json,parquet}`. The greater file name wins.
+    Uuid { filename: String },
+}
+
+impl CheckpointInstance {
+    /// The instance a checkpoint part belongs to, or `None` for a non-checkpoint file.
+    pub(crate) fn of<Location: AsUrl>(part: &ParsedLogPath<Location>) -> Option<Self> {
+        match &part.file_type {
+            LogPathFileType::ClassicCheckpoint => Some(Self::Classic),
+            LogPathFileType::UuidCheckpoint => Some(Self::Uuid {
+                filename: part.filename.clone(),
+            }),
+            LogPathFileType::MultiPartCheckpoint { num_parts, .. } => Some(Self::MultiPart {
+                num_parts: *num_parts,
+            }),
+            _ => None,
+        }
+    }
+
+    /// How many files this checkpoint spans.
+    pub(crate) fn num_parts(&self) -> usize {
+        match self {
+            Self::MultiPart { num_parts } => *num_parts as usize,
+            Self::Classic | Self::Uuid { .. } => 1,
+        }
+    }
+
+    /// Whether `part_files` holds every part this checkpoint needs.
+    pub(crate) fn is_complete<Location: AsUrl>(
+        &self,
+        part_files: &[ParsedLogPath<Location>],
+    ) -> bool {
+        self.num_parts() == part_files.len()
+    }
 }
 
 /// A ParsedLogPath is a well-understood path to a file in the _delta_log directory.
@@ -102,12 +166,66 @@ impl AsUrl for Url {
     }
 }
 
+/// Compare `left` and `right` by their percent-decoded path bytes, ignoring other URL components.
+///
+/// Returns their lexicographic ordering without allocating decoded strings.
+#[internal_api]
+pub(crate) fn compare_listing_paths(left: &Url, right: &Url) -> Ordering {
+    percent_decode_str(left.path()).cmp(percent_decode_str(right.path()))
+}
+
+/// Validate that `end` belongs to the directory listed from `start`.
+///
+/// Query strings and fragments do not affect directory identity. Returns an error when the
+/// bounds select different directories or their parent URLs cannot be resolved.
+#[internal_api]
+pub(crate) fn validate_list_range(start: &Url, end: &Url) -> DeltaResult<()> {
+    let mut start_directory = start.join(".")?;
+    let mut end_directory = end.join(".")?;
+    start_directory.set_query(None);
+    start_directory.set_fragment(None);
+    end_directory.set_query(None);
+    end_directory.set_fragment(None);
+    if start_directory != end_directory {
+        return Err(Error::generic(
+            "Listing bounds must belong to the same directory",
+        ));
+    }
+    Ok(())
+}
+
 fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> bool {
     path_segments.any(|p| p == DELTA_LOG_DIR)
 }
 
+/// Returns whether `rel_path`, a path relative to the `_delta_log/` directory, could still be
+/// within the version-named region of a lexicographically sorted log listing.
+///
+/// Every listable log file begins with a 20-digit version, so its first byte is an ASCII digit.
+/// Paths like `_staged_commits/`, `_sidecars/`, and `_last_checkpoint` sort after every
+/// version-named file because `'_'` (0x5F) > `'9'` (0x39), so a sorted listing can stop at the
+/// first relative path whose first byte sorts past `'9'`.
+///
+/// This is a scan bound, not a log-file filter, so it must not require a digit first byte: a
+/// path sorting before `'0'` (e.g. a dot-prefixed `.{version}.json.crc` written by some engines)
+/// can still be followed by version-named files, and stopping there would silently drop them.
+/// Such paths are kept here and discarded by [`ParsedLogPath`] parsing instead. An empty
+/// `rel_path` is conservatively kept.
+pub(crate) fn may_begin_listable_log_path(rel_path: &str) -> bool {
+    rel_path.as_bytes().first().is_none_or(|b| *b <= b'9')
+}
+
 impl<Location: AsUrl> ParsedLogPath<Location> {
-    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
+    /// Estimated heap size in bytes, best-effort estimate.
+    ///
+    /// The Url(self.location) is measured via `len()` because it doesn't expose the capacity of its
+    /// internal `serialization` String. Any String capacity slack on it is not counted.
+    pub(crate) fn estimated_heap_size_bytes(&self) -> usize {
+        self.filename.capacity() + self.extension.capacity() + self.location.as_url().as_str().len()
+    }
+
+    // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is
+    // local.
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
@@ -146,7 +264,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
-        // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
+        // this check determines if we're in the delta log dir, or in the staged commits dir. The
+        // check is:
         // 1. If the dir is named _staged_commits, check if the parent dir is _delta_log, and ensure
         //    no higher level directories are _also_ named _delta_log. If those checks pass we're in
         //    the staged_commits dir
@@ -178,7 +297,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
                 }
             }
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
-            ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::SinglePartCheckpoint,
+            ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::ClassicCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
                 let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
                     return Ok(None);
@@ -239,7 +358,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn should_list(&self) -> bool {
         match self.file_type {
             LogPathFileType::Commit
-            | LogPathFileType::SinglePartCheckpoint
+            | LogPathFileType::ClassicCheckpoint
             | LogPathFileType::UuidCheckpoint
             | LogPathFileType::MultiPartCheckpoint { .. }
             | LogPathFileType::CompactedCommit { .. }
@@ -247,6 +366,12 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             | LogPathFileType::Unknown => true,
             LogPathFileType::StagedCommit => false,
         }
+    }
+
+    /// Convenience wrapper around [`version_as_i64`] for this parsed path's `version`.
+    #[cfg(feature = "declarative-plans")]
+    pub(crate) fn version_as_i64(&self) -> DeltaResult<i64> {
+        crate::version_as_i64(self.version)
     }
 
     #[internal_api]
@@ -259,18 +384,20 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
 
     #[internal_api]
     pub(crate) fn is_checkpoint(&self) -> bool {
-        matches!(
-            self.file_type,
-            LogPathFileType::SinglePartCheckpoint
-                | LogPathFileType::MultiPartCheckpoint { .. }
-                | LogPathFileType::UuidCheckpoint
-        )
+        CheckpointInstance::of(self).is_some()
     }
 
     #[internal_api]
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
+    }
+
+    /// Whether this log path's file extension is `json`.
+    #[internal_api]
+    #[allow(dead_code)] // not all cfgs exercise this
+    pub(crate) fn is_json(&self) -> bool {
+        self.extension == "json"
     }
 }
 
@@ -283,6 +410,7 @@ impl ParsedLogPath<FileMeta> {
     ///
     /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
     /// Callers should handle enablement version checks before calling this method.
+    #[tracing::instrument(skip(engine), ret, fields(version = self.version, path = %self.location.as_url()))]
     pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
         // Only works on commit files
         if !self.is_commit() {
@@ -340,7 +468,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedCheckpointPath<Url> for a classic parquet checkpoint file
-    #[allow(dead_code)] // TODO: Remove this once we have a use case for it
     pub(crate) fn new_classic_parquet_checkpoint(
         table_root: &Url,
         version: Version,
@@ -372,6 +499,7 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new `ParsedLogPath<Url>` for a version checksum (CRC) file.
+    #[internal_api]
     pub(crate) fn new_crc(table_root: &Url, version: Version) -> DeltaResult<Self> {
         let filename = format!("{version:020}.crc");
         let path = Self::create_path(table_root, filename)?;
@@ -384,6 +512,8 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedLogPath<Url> for a log compaction file
+    // TODO(#2337): remove allow(dead_code) when log compaction is re-enabled
+    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
@@ -398,6 +528,20 @@ impl ParsedLogPath<Url> {
         }
         Ok(path)
     }
+}
+
+/// A checkpoint sidecar is a uniquely-named parquet file: `{unique}.parquet` where `unique` is
+/// some unique string such as a UUID. We use `<version>.checkpoint.<uuid>.parquet` here.
+///
+/// Sidecar paths should be URI-encoded. All characters in the filename here are Unreserved
+/// Characters, so we can just retain them. Ref: <https://www.ietf.org/rfc/rfc2396.txt>
+pub(crate) fn new_sidecar(table_root: &Url, version: Version) -> DeltaResult<(String, Url)> {
+    let filename = format!("{version:020}.checkpoint.{}.parquet", Uuid::new_v4());
+    let url = table_root
+        .join(DELTA_LOG_DIR_WITH_SLASH)?
+        .join(SIDECAR_DIR_WITH_SLASH)?
+        .join(&filename)?;
+    Ok((filename, url))
 }
 
 /// A wrapper around parsed log path to provide more structure/safety when handling
@@ -443,7 +587,6 @@ impl LogRoot {
     }
 
     /// Create a new staged commit path (absolute path) for the given version.
-    #[allow(unused)] // TODO: Remove this once we remove catalog-managed feature
     pub(crate) fn new_staged_commit_path(
         &self,
         version: Version,
@@ -462,12 +605,36 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use test_utils::add_commit;
+
     use super::*;
-    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::object_store::memory::InMemory;
-    use crate::utils::test_utils::assert_result_error_with_message;
-    use test_utils::add_commit;
+    use crate::unit_test_utils::assert_result_error_with_message;
+
+    /// Builds a `ParsedLogPath` by parsing a real log file name, so `filename`, `extension` and
+    /// `file_type` agree. `size` is a parameter because listing tests use it to mark where a file
+    /// came from.
+    pub(crate) fn parse_log_path(filename: &str, size: u64) -> ParsedLogPath {
+        let url = Url::parse(&format!("memory:///_delta_log/{filename}")).unwrap();
+        ParsedLogPath::try_from(FileMeta {
+            location: url,
+            last_modified: 0,
+            size,
+        })
+        .unwrap_or_else(|e| panic!("{filename} is not a log path: {e}"))
+        .unwrap_or_else(|| panic!("{filename} is not a log path"))
+    }
+
+    /// One part of a multi-part checkpoint. Kernel never writes these, so there's no production
+    /// constructor to reuse.
+    pub(crate) fn multipart_checkpoint_name(
+        version: Version,
+        part_num: u32,
+        num_parts: u32,
+    ) -> String {
+        format!("{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet")
+    }
 
     impl ParsedLogPath<FileMeta> {
         pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
@@ -477,7 +644,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Commit);
@@ -494,7 +661,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::StagedCommit);
@@ -508,7 +675,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .join(&filename)
                 .unwrap();
-            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 100))
                 .unwrap()
                 .unwrap();
             assert!(parsed.file_type == LogPathFileType::Crc);
@@ -532,6 +699,23 @@ pub(crate) mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         assert!(url.path().ends_with('/'));
         url
+    }
+
+    #[test]
+    fn test_may_begin_listable_log_path() {
+        // version-named files, and anything sorting before them, keep the scan going
+        assert!(may_begin_listable_log_path("00000000000000000010.json"));
+        assert!(may_begin_listable_log_path(
+            ".00000000000000000010.json.crc"
+        ));
+        assert!(may_begin_listable_log_path(""));
+        // paths sorting past '9' end the version-named region
+        assert!(!may_begin_listable_log_path("_last_checkpoint"));
+        assert!(!may_begin_listable_log_path("_sidecars/3a0d65cd.parquet"));
+        assert!(!may_begin_listable_log_path(
+            "_staged_commits/00000000000000000010.3a0d65cd.json"
+        ));
+        assert!(!may_begin_listable_log_path("Zsentinel"));
     }
 
     #[test]
@@ -659,7 +843,7 @@ pub(crate) mod tests {
         assert_eq!(log_path.version, 2);
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::SinglePartCheckpoint
+            LogPathFileType::ClassicCheckpoint
         ));
         assert!(!log_path.is_commit());
         assert!(log_path.is_checkpoint());
@@ -948,7 +1132,7 @@ pub(crate) mod tests {
         assert_eq!(log_path.extension, "parquet");
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::SinglePartCheckpoint
+            LogPathFileType::ClassicCheckpoint
         ));
         assert_eq!(log_path.filename, "00000000000000000010.checkpoint.parquet");
     }
@@ -1012,7 +1196,7 @@ pub(crate) mod tests {
         for (file_type, should_list) in [
             (LogPathFileType::Commit, true),
             (LogPathFileType::StagedCommit, false),
-            (LogPathFileType::SinglePartCheckpoint, true),
+            (LogPathFileType::ClassicCheckpoint, true),
             (LogPathFileType::UuidCheckpoint, true),
             (
                 LogPathFileType::MultiPartCheckpoint {
@@ -1038,7 +1222,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 
@@ -1068,7 +1252,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngineBuilder::new(store.clone()).build();
+        let engine = SyncEngine::new_with_store(store.clone());
         let table_root = "memory://test/";
         let table_url = url::Url::parse(table_root).unwrap();
 
@@ -1118,5 +1302,37 @@ pub(crate) mod tests {
             result,
             "read_in_commit_timestamp can only be called on commit files",
         );
+    }
+
+    /// Verifies `new_sidecar` builds a `<version:020>.checkpoint.<uuid>.parquet` filename
+    /// under `<table_root>/_delta_log/_sidecars/`.
+    #[rstest::rstest]
+    #[case::version_zero(0)]
+    #[case::small_version(7)]
+    #[case::large_version(1_234_567_890)]
+    fn test_new_sidecar_path(#[case] version: Version) {
+        let table_root = Url::parse("memory:///table/").unwrap();
+        let (filename, url) = new_sidecar(&table_root, version).unwrap();
+
+        // Filename: `<version:020>.checkpoint.<uuid>.parquet`
+        let prefix = format!("{version:020}.checkpoint.");
+        assert!(
+            filename.starts_with(&prefix) && filename.ends_with(".parquet"),
+            "unexpected filename: {filename}"
+        );
+        // The middle segment must be a valid UUID.
+        let uuid_part = filename
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".parquet"))
+            .unwrap();
+        Uuid::parse_str(uuid_part).expect("middle segment must be a valid UUID");
+
+        // URL: `<table_root>/_delta_log/_sidecars/<filename>`
+        let expected = table_root
+            .join("_delta_log/_sidecars/")
+            .unwrap()
+            .join(&filename)
+            .unwrap();
+        assert_eq!(url, expected);
     }
 }
