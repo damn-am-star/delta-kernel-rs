@@ -14,7 +14,7 @@ clippy-no-default-kernel-dependents = [
   "delta_kernel_ffi_macros",
   "--",
   "-D",
-  "warnings",
+  "war",
 ]
 check-no-default-kernel = [
   "check",
